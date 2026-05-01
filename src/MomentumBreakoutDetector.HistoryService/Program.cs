@@ -76,6 +76,20 @@ builder.Services.AddScoped<IMacroDataProvider>(sp =>
     return new MacroDataProvider(opts.ConnectionString, logger, fred);
 });
 
+// --- Option chains (micro-PR #4) -----------------------------------------
+// Polygon:* (ApiKey + BaseUrl) read from configuration / env (e.g. set
+// Polygon__ApiKey via docker compose) so the chain fetcher (and any other
+// Polygon-backed fetcher landing in sibling micro-PRs) can pull the secret
+// via IOptions<PolygonOptions>.
+builder.Services.Configure<PolygonOptions>(
+    builder.Configuration.GetSection(PolygonOptions.SectionName));
+
+// Typed HttpClient for the chain fetcher — IHttpClientFactory keeps the
+// underlying SocketsHttpHandler pooled and bounds DNS / TCP lifetimes.
+builder.Services.AddHttpClient<IPolygonChainFetcher, PolygonChainFetcher>();
+// Provider is scoped so each gRPC call gets a fresh NpgsqlConnection.
+builder.Services.AddScoped<IOptionChainProvider, OptionChainProvider>();
+
 // --- gRPC -----------------------------------------------------------------
 builder.Services.AddGrpc(options =>
 {

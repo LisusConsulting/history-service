@@ -29,15 +29,21 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
     private readonly ILogger<HistoryServiceImpl> _logger;
     private readonly IOptionQuotesProvider _quotes;
     private readonly IMacroDataProvider? _macroProvider;
+    // Optional provider injection — each lift PR (#2-#5) sets its own
+    // provider. Nullable so that earlier-not-yet-merged PRs don't break
+    // the DI graph; an absent provider falls through to Unimplemented.
+    private readonly IOptionChainProvider? _optionChainProvider;
 
     public HistoryServiceImpl(
         ILogger<HistoryServiceImpl> logger,
         IOptionQuotesProvider quotes,
-        IMacroDataProvider? macroProvider = null)
+        IMacroDataProvider? macroProvider = null,
+        IOptionChainProvider? optionChainProvider = null)
     {
         _logger = logger;
         _quotes = quotes;
         _macroProvider = macroProvider;
+        _optionChainProvider = optionChainProvider;
     }
 
     public override Task<GetBarsResponse> GetBars(GetBarsRequest request, ServerCallContext context)
@@ -90,10 +96,107 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         return tmpResp;
     }
 
-    public override Task<GetOptionChainResponse> GetOptionChain(GetOptionChainRequest request, ServerCallContext context)
+    public override async Task<GetOptionChainResponse> GetOptionChain(GetOptionChainRequest request, ServerCallContext context)
     {
-        _logger.LogInformation("GetOptionChain called (stub) underlying={Underlying}", request.UnderlyingTicker);
-        throw new RpcException(new Status(StatusCode.Unimplemented, "TODO: micro-PR #4 — lift PolygonChainFetcher + chain provider."));
+        if (_optionChainProvider is null)
+        {
+            // DI not wired — typical only in tests that intentionally omit the provider.
+            throw new RpcException(new Status(StatusCode.Unimplemented, "Option-chain provider is not registered."));
+        }
+
+        if (string.IsNullOrWhiteSpace(request.UnderlyingTicker))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "underlying_ticker is required."));
+        }
+        if (request.AsOfDate is null)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "as_of_date is required."));
+        }
+
+        _logger.LogInformation(
+            "GetOptionChain underlying={Underlying} as_of={AsOf}",
+            request.UnderlyingTicker, request.AsOfDate.ToDateTime());
+
+        // proto Timestamp → DateOnly. Time component intentionally ignored;
+        // the contract's comment on as_of_date says so.
+        var tmpAsOfUtc = request.AsOfDate.ToDateTime();
+        var tmpAsOfDate = DateOnly.FromDateTime(tmpAsOfUtc);
+
+        var tmpResult = await _optionChainProvider.GetChainAsync(
+            request.UnderlyingTicker, tmpAsOfDate, context.CancellationToken);
+
+        var tmpResponse = new GetOptionChainResponse
+        {
+            CacheHit = tmpResult.CacheHit,
+            IsMissMarker = tmpResult.IsMissMarker,
+        };
+
+        // Apply optional filters at the gRPC layer rather than baking them
+        // into the SQL query. The chain is small (~500 rows on TSLA) so an
+        // in-memory filter is cheap, and keeps the provider's stable
+        // ORDER BY clause untouched. See proto: contract_type / strike_min /
+        // strike_max / expiration_after / expiration_before are "0 or empty
+        // = no filter".
+        var tmpFiltered = ApplyFilters(tmpResult.Contracts, request);
+        foreach (var tmpRow in tmpFiltered)
+        {
+            tmpResponse.Contracts.Add(MapToProto(tmpRow));
+        }
+
+        return tmpResponse;
+    }
+
+    private static IEnumerable<OptionContractRow> ApplyFilters(
+        IReadOnlyList<OptionContractRow> inRows, GetOptionChainRequest inRequest)
+    {
+        IEnumerable<OptionContractRow> tmp = inRows;
+
+        if (inRequest.ContractType != ContractType.Unspecified)
+        {
+            var tmpWanted = inRequest.ContractType == ContractType.Call ? "call" : "put";
+            tmp = tmp.Where(r => string.Equals(r.ContractType, tmpWanted, StringComparison.OrdinalIgnoreCase));
+        }
+        if (inRequest.ExpirationAfter is not null)
+        {
+            var tmpAfter = DateOnly.FromDateTime(inRequest.ExpirationAfter.ToDateTime());
+            tmp = tmp.Where(r => r.ExpirationDate > tmpAfter);
+        }
+        if (inRequest.ExpirationBefore is not null)
+        {
+            var tmpBefore = DateOnly.FromDateTime(inRequest.ExpirationBefore.ToDateTime());
+            tmp = tmp.Where(r => r.ExpirationDate < tmpBefore);
+        }
+        if (inRequest.StrikeMin > 0)
+        {
+            tmp = tmp.Where(r => r.StrikePrice.HasValue && (double)r.StrikePrice.Value >= inRequest.StrikeMin);
+        }
+        if (inRequest.StrikeMax > 0)
+        {
+            tmp = tmp.Where(r => r.StrikePrice.HasValue && (double)r.StrikePrice.Value <= inRequest.StrikeMax);
+        }
+        return tmp;
+    }
+
+    private static OptionContract MapToProto(OptionContractRow inRow)
+    {
+        var tmpContract = new OptionContract
+        {
+            Ticker = inRow.Ticker,
+            UnderlyingTicker = inRow.UnderlyingTicker,
+            ContractType = inRow.ContractType?.ToLowerInvariant() switch
+            {
+                "call" => ContractType.Call,
+                "put"  => ContractType.Put,
+                _      => ContractType.Unspecified,
+            },
+            ExerciseStyle = inRow.ExerciseStyle ?? string.Empty,
+            ExpirationDate = Timestamp.FromDateTime(
+                inRow.ExpirationDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc)),
+            StrikePrice = inRow.StrikePrice.HasValue ? (double)inRow.StrikePrice.Value : 0d,
+            SharesPerContract = inRow.SharesPerContract ?? 0,
+            PrimaryExchange = inRow.PrimaryExchange ?? string.Empty,
+        };
+        return tmpContract;
     }
 
     public override async Task<GetMacroResponse> GetMacro(GetMacroRequest request, ServerCallContext context)
