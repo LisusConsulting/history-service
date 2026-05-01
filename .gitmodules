@@ -1,0 +1,3 @@
+[submodule "external/polygon-net-client"]
+	path = external/polygon-net-client
+	url = https://github.com/LisusConsulting/polygon-net-client.git

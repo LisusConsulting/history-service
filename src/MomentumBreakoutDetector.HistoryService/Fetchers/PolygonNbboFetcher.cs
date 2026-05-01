@@ -1,72 +1,66 @@
-using System.Net;
-using System.Net.Http.Json;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using TreyThomasCodes.Polygon.RestClient.Exceptions;
+using TreyThomasCodes.Polygon.RestClient.Requests.Options;
+using TreyThomasCodes.Polygon.RestClient.Services;
 
 namespace MomentumBreakoutDetector.HistoryService.Fetchers;
 
 /// <summary>
-/// Lifted from MBD's <c>PostgresOptionQuoteService.FetchAndCacheAsync</c>
-/// (PRs #98 + #121). Calls Polygon <c>/v3/quotes/{ticker}?timestamp.lte=…</c>
-/// with limit=1 + order=desc to get the most recent NBBO at-or-before the
-/// requested timestamp.
+/// On-demand Polygon /v3/quotes NBBO fetch. Phase E: refactored from raw
+/// HttpClient to the polygon-net-client SDK 0.10.0
+/// (<see cref="IOptionsService.GetQuotesAsync(GetQuotesRequest, CancellationToken)"/>).
 ///
-/// Differences vs. the MBD source:
-///   - Plain HttpClient (the service is self-contained; no Refit / vendored
-///     client wrapper). Same endpoint, same query shape.
-///   - No <c>IBacktestFetchBudget</c> plumbing — that path was removed in
-///     PR #133.
-///   - 3 s per-call timeout via a linked CTS, mirroring
-///     <c>DefaultPerCallTimeoutMs</c>.
-///   - SemaphoreSlim concurrency cap (default 8) mirroring
-///     <c>DefaultMaxConcurrentFetches</c>.
+/// Same wire call as the original lift: <c>/v3/quotes/{ticker}?timestamp.lte=…</c>
+/// with <c>order=desc</c> and <c>limit=1</c> to fetch the most recent NBBO
+/// at-or-before the requested timestamp.
 ///
-/// Registered as a singleton in Program.cs so the SemaphoreSlim is
-/// process-wide and HttpClient is reused (handler pooling).
+/// Production semantics preserved:
+///   - Concurrency cap + per-call timeout — moved to the SDK pipeline
+///     handlers (<c>ConcurrencyLimitingHandler</c> + <c>PerCallTimeoutHandler</c>).
+///   - Three-state outcome (Hit / Miss / Transient) preserved verbatim.
+///   - 401/403 + body containing "not authorized" → Miss with reason
+///     "plan-not-authorized" (caller writes miss-marker).
+///   - 429 + 5xx → Transient (caller does NOT write miss-marker; future
+///     calls retry).
+///
+/// Note on SDK choice: the typed <c>GetQuotesAsync</c> method translates
+/// non-success responses into <see cref="PolygonApiException"/>; we catch
+/// that exception type and inspect <c>IsUnauthorized</c> / <c>IsForbidden</c>
+/// / <c>IsRateLimited</c> to fan out into the same Hit/Miss/Transient
+/// shape the original code derived from raw HttpStatusCode. The Options
+/// service does NOT expose a Raw variant for /v3/quotes (only for
+/// /v3/snapshot/options/{...}), so the typed API is the cleanest fit
+/// here.
 /// </summary>
-public sealed class PolygonNbboFetcher : IPolygonNbboFetcher, IDisposable
+public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
 {
     public const int DefaultPerCallTimeoutMs = 3000;
     public const int DefaultMaxConcurrentFetches = 8;
 
-    private readonly HttpClient m_Http;
+    private readonly IOptionsService m_Options;
     private readonly ILogger<PolygonNbboFetcher> m_Logger;
-    private readonly SemaphoreSlim m_Gate;
-    private readonly int m_PerCallTimeoutMs;
-    private readonly string m_ApiKey;
-
-    private static readonly JsonSerializerOptions s_JsonOpts = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    };
 
     public PolygonNbboFetcher(
-        HttpClient inHttp,
-        IOptions<HistoryServiceOptions> inOpts,
+        IOptionsService inOptions,
         ILogger<PolygonNbboFetcher> inLogger)
     {
-        m_Http = inHttp;
+        m_Options = inOptions;
         m_Logger = inLogger;
-        var tmpOpts = inOpts.Value;
-        m_ApiKey = tmpOpts.PolygonApiKey ?? "";
-        m_PerCallTimeoutMs = tmpOpts.PolygonPerCallTimeoutMs > 0
-            ? tmpOpts.PolygonPerCallTimeoutMs
-            : DefaultPerCallTimeoutMs;
-        var tmpMaxCc = tmpOpts.PolygonMaxConcurrentFetches > 0
-            ? tmpOpts.PolygonMaxConcurrentFetches
-            : DefaultMaxConcurrentFetches;
-        m_Gate = new SemaphoreSlim(tmpMaxCc, tmpMaxCc);
+    }
 
-        if (m_Http.BaseAddress is null)
-        {
-            m_Http.BaseAddress = new Uri(
-                string.IsNullOrWhiteSpace(tmpOpts.PolygonBaseUrl)
-                    ? "https://api.polygon.io"
-                    : tmpOpts.PolygonBaseUrl);
-        }
+    /// <summary>
+    /// IOptions overload retained for parity with the legacy ctor surface
+    /// — DI bindings that previously bound <see cref="IOptions{HistoryServiceOptions}"/>
+    /// still resolve. The options bag is unused: timeouts + concurrency
+    /// live in the pipeline handlers now.
+    /// </summary>
+    public PolygonNbboFetcher(
+        IOptionsService inOptions,
+        IOptions<HistoryServiceOptions> _,
+        ILogger<PolygonNbboFetcher> inLogger)
+        : this(inOptions, inLogger)
+    {
     }
 
     public async Task<PolygonNbboFetch> FetchAsync(
@@ -74,48 +68,25 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher, IDisposable
         DateTime inTsUtc,
         CancellationToken inCt = default)
     {
-        // Per-call 3 s ceiling. The linked CTS aborts a single hung call
-        // without disturbing the caller's CT — same pattern as MBD's
-        // TradingEngine.POLYGON_PER_TICK_TIMEOUT_MS (PR #110).
-        using var tmpTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(inCt);
-        tmpTimeoutCts.CancelAfter(m_PerCallTimeoutMs);
+        // Polygon accepts ISO-8601 with seconds, in UTC. e.g.
+        // "2025-12-15T15:30:00Z". timestamp.lte + order=desc + limit=1
+        // returns the most recent NBBO at-or-before the requested ts.
+        var tmpTsParam = inTsUtc.ToString("yyyy-MM-ddTHH:mm:ssZ");
+        var tmpRequest = new GetQuotesRequest
+        {
+            OptionsTicker = inTicker,
+            TimestampLte = tmpTsParam,
+            Order = "desc",
+            Limit = 1,
+        };
 
-        await m_Gate.WaitAsync(inCt).ConfigureAwait(false);
         try
         {
-            // Polygon accepts ISO-8601 with seconds, in UTC. e.g. "2025-12-15T15:30:00Z".
-            var tmpTsParam = inTsUtc.ToString("yyyy-MM-ddTHH:mm:ssZ");
-            var tmpUri = $"/v3/quotes/{Uri.EscapeDataString(inTicker)}"
-                + $"?timestamp.lte={tmpTsParam}&order=desc&limit=1";
-            if (!string.IsNullOrWhiteSpace(m_ApiKey))
-            {
-                tmpUri += $"&apiKey={Uri.EscapeDataString(m_ApiKey)}";
-            }
-
-            using var tmpReq = new HttpRequestMessage(HttpMethod.Get, tmpUri);
-            using var tmpResp = await m_Http
-                .SendAsync(tmpReq, HttpCompletionOption.ResponseHeadersRead, tmpTimeoutCts.Token)
+            var tmpResp = await m_Options
+                .GetQuotesAsync(tmpRequest, inCt)
                 .ConfigureAwait(false);
 
-            if (tmpResp.StatusCode == HttpStatusCode.Unauthorized
-                || tmpResp.StatusCode == HttpStatusCode.Forbidden)
-            {
-                // Plan-tier limit. Polygon returns NOT_AUTHORIZED outside
-                // the subscription's history depth (Options Advanced /v3
-                // quotes start 2022-03-07). Same handling as MBD lift.
-                m_Logger.LogInformation(
-                    "Quote NOT_AUTHORIZED for {Ticker} @ {Ts:O} — outside plan history depth",
-                    inTicker, inTsUtc);
-                return new PolygonNbboFetch(PolygonNbboOutcome.Miss, null, "plan-not-authorized");
-            }
-
-            tmpResp.EnsureSuccessStatusCode();
-
-            var tmpPayload = await tmpResp.Content
-                .ReadFromJsonAsync<PolygonQuotesEnvelope>(s_JsonOpts, tmpTimeoutCts.Token)
-                .ConfigureAwait(false);
-
-            var tmpQuote = tmpPayload?.Results?.FirstOrDefault();
+            var tmpQuote = tmpResp?.Results?.FirstOrDefault();
             if (tmpQuote is null
                 || tmpQuote.BidPrice is null || tmpQuote.AskPrice is null
                 || tmpQuote.SipTimestamp is null)
@@ -134,51 +105,54 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher, IDisposable
                     Ticker: inTicker,
                     RequestedTsUtc: inTsUtc,
                     AsOfTsUtc: tmpAsOf,
-                    BidPrice: (decimal)tmpQuote.BidPrice.Value,
-                    AskPrice: (decimal)tmpQuote.AskPrice.Value,
+                    BidPrice: tmpQuote.BidPrice.Value,
+                    AskPrice: tmpQuote.AskPrice.Value,
                     BidSize: tmpQuote.BidSize,
                     AskSize: tmpQuote.AskSize,
                     BidExchange: tmpQuote.BidExchange,
                     AskExchange: tmpQuote.AskExchange),
                 MissReason: null);
         }
-        catch (OperationCanceledException) when (tmpTimeoutCts.IsCancellationRequested
-                                                 && !inCt.IsCancellationRequested)
+        catch (PolygonApiException ex) when (ex.IsUnauthorized || ex.IsForbidden)
+        {
+            // Plan-tier limit. Polygon returns NOT_AUTHORIZED outside the
+            // subscription's history depth (Options Advanced /v3 quotes
+            // start 2022-03-07).
+            m_Logger.LogInformation(
+                "Quote NOT_AUTHORIZED for {Ticker} @ {Ts:O} — outside plan history depth",
+                inTicker, inTsUtc);
+            return new PolygonNbboFetch(PolygonNbboOutcome.Miss, null, "plan-not-authorized");
+        }
+        catch (PolygonApiException ex) when (ex.IsNotFound)
+        {
+            // 404 — same shape as a Miss. Caller writes a marker.
+            return new PolygonNbboFetch(PolygonNbboOutcome.Miss, null, "not-found");
+        }
+        catch (PolygonApiException ex) when (ex.IsRateLimited)
         {
             m_Logger.LogWarning(
-                "Polygon quote fetch timed out after {TimeoutMs}ms for {Ticker} @ {Ts:O} — transient",
-                m_PerCallTimeoutMs, inTicker, inTsUtc);
+                "Quote 429 rate-limited for {Ticker} @ {Ts:O} — transient",
+                inTicker, inTsUtc);
+            return new PolygonNbboFetch(PolygonNbboOutcome.Transient, null, "rate-limited");
+        }
+        catch (TimeoutException)
+        {
+            // PerCallTimeoutHandler fired. Don't poison the cache —
+            // future call retries.
+            m_Logger.LogWarning(
+                "Polygon quote fetch timed out for {Ticker} @ {Ts:O} — transient",
+                inTicker, inTsUtc);
             return new PolygonNbboFetch(PolygonNbboOutcome.Transient, null, "timeout");
         }
         catch (Exception ex)
         {
-            // Don't poison the cache with transient errors.
+            // 5xx (PolygonApiException with IsServerError), HttpRequestException,
+            // JsonException, etc. Don't poison the cache on transient
+            // upstream blips — same intent as the original lift.
             m_Logger.LogWarning(ex,
                 "Polygon quote fetch failed for {Ticker} @ {Ts:O}",
                 inTicker, inTsUtc);
             return new PolygonNbboFetch(PolygonNbboOutcome.Transient, null, "exception");
         }
-        finally
-        {
-            m_Gate.Release();
-        }
     }
-
-    public void Dispose() => m_Gate.Dispose();
-
-    // -------------- Polygon /v3/quotes payload shape --------------------
-    // Public-ish surface kept internal; only the fields we read are typed.
-
-    private sealed record PolygonQuotesEnvelope(
-        [property: JsonPropertyName("results")] List<PolygonQuoteRow>? Results,
-        [property: JsonPropertyName("status")] string? Status);
-
-    private sealed record PolygonQuoteRow(
-        [property: JsonPropertyName("bid_price")] double? BidPrice,
-        [property: JsonPropertyName("ask_price")] double? AskPrice,
-        [property: JsonPropertyName("bid_size")] int? BidSize,
-        [property: JsonPropertyName("ask_size")] int? AskSize,
-        [property: JsonPropertyName("bid_exchange")] int? BidExchange,
-        [property: JsonPropertyName("ask_exchange")] int? AskExchange,
-        [property: JsonPropertyName("sip_timestamp")] long? SipTimestamp);
 }

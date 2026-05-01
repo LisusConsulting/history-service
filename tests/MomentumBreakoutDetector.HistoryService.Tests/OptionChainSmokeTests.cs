@@ -1,41 +1,33 @@
-using System.Net;
-using System.Text;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
 using MomentumBreakoutDetector.HistoryService.Providers;
+using NSubstitute;
 using Npgsql;
 using Shouldly;
 using Testcontainers.PostgreSql;
+using TreyThomasCodes.Polygon.Models.Common;
+using TreyThomasCodes.Polygon.Models.Options;
+using TreyThomasCodes.Polygon.RestClient.Requests.Options;
+using TreyThomasCodes.Polygon.RestClient.Services;
 using Xunit;
 
 namespace MomentumBreakoutDetector.HistoryService.Tests;
 
 /// <summary>
-/// Smoke test for micro-PR #4 — provider integration:
-///   Cold-start flow: empty cache → stubbed Polygon JSON → upsert →
-///   warm read returns the upserted contract list with cache_hit=true
-///   on the second call.
+/// Smoke test for the option-chain provider. Phase E: post the SDK
+/// refactor (PolygonChainFetcher now consumes IOptionsService instead of
+/// raw HttpClient), this test stubs the SDK service rather than the
+/// HTTP message handler. Same end-to-end contract:
 ///
-/// Provides:
-///   - A throwaway TimescaleDB container (Testcontainers).
-///   - A stubbed HttpClient that returns a hand-crafted Polygon
-///     /v3/reference/options/contracts response shape.
-///
-/// Migration #003 + #005 (chains table + miss-markers table) is applied
-/// to the container before the test runs.
+///   Cold-start flow: empty cache → stub returns 2 contracts → upsert →
+///   warm read returns the upserted contract list with cache_hit=true on
+///   the second call (and the SDK stub is NOT invoked again).
 /// </summary>
 public class OptionChainSmokeTests : IAsyncLifetime
 {
     private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
-        // The production image is timescaledb/timescaledb:latest-pg16; the
-        // chains table is a hypertable. For the smoke test we don't need
-        // hypertable-specific behavior — a plain postgres container with
-        // the table created as a normal table is enough to exercise the
-        // upsert + cache + miss-marker code paths. The migration calls
-        // create_hypertable() guarded by if_not_exists; we rewrite that to
-        // a no-op below.
         .WithImage("postgres:16-alpine")
         .WithDatabase("mbd_history")
         .WithUsername("mbd")
@@ -46,8 +38,6 @@ public class OptionChainSmokeTests : IAsyncLifetime
     {
         await _postgres.StartAsync();
 
-        // Apply just the bits this test needs: contracts table + chains
-        // miss-markers. Skip create_hypertable (Timescale-only).
         await using var tmpConn = new NpgsqlConnection(_postgres.GetConnectionString());
         await tmpConn.OpenAsync();
         await using var tmpCmd = tmpConn.CreateCommand();
@@ -82,46 +72,50 @@ public class OptionChainSmokeTests : IAsyncLifetime
     [Fact]
     public async Task ColdStart_ThenWarm_ReturnsContracts_AndShortCircuitsSecondCall()
     {
-        // ---- Stub Polygon response ----
-        var tmpStubBody = """
+        // ---- Stub IOptionsService — returns 2 contracts on first call ----
+        var tmpStubService = Substitute.For<IOptionsService>();
+        var tmpResults = new List<OptionsContract>
         {
-          "results": [
+            new()
             {
-              "ticker": "O:TSLA240105C00250000",
-              "underlying_ticker": "TSLA",
-              "contract_type": "call",
-              "exercise_style": "american",
-              "expiration_date": "2024-01-05",
-              "strike_price": 250.0,
-              "shares_per_contract": 100,
-              "primary_exchange": "BATO"
+                Ticker = "O:TSLA240105C00250000",
+                UnderlyingTicker = "TSLA",
+                ContractType = "call",
+                ExerciseStyle = "american",
+                ExpirationDate = "2024-01-05",
+                StrikePrice = 250.0m,
+                SharesPerContract = 100,
+                PrimaryExchange = "BATO",
             },
+            new()
             {
-              "ticker": "O:TSLA240105P00240000",
-              "underlying_ticker": "TSLA",
-              "contract_type": "put",
-              "exercise_style": "american",
-              "expiration_date": "2024-01-05",
-              "strike_price": 240.0,
-              "shares_per_contract": 100,
-              "primary_exchange": "BATO"
-            }
-          ],
-          "next_url": null,
-          "status": "OK"
-        }
-        """;
-        var tmpHandler = new CountingStubHandler(tmpStubBody);
-        var tmpHttp = new HttpClient(tmpHandler);
+                Ticker = "O:TSLA240105P00240000",
+                UnderlyingTicker = "TSLA",
+                ContractType = "put",
+                ExerciseStyle = "american",
+                ExpirationDate = "2024-01-05",
+                StrikePrice = 240.0m,
+                SharesPerContract = 100,
+                PrimaryExchange = "BATO",
+            },
+        };
 
-        var tmpPolygonOpts = Options.Create(new PolygonOptions
+        var tmpEnvelope = new PolygonResponse<List<OptionsContract>>
         {
-            ApiKey = "stub-key",
-            BaseUrl = "https://stub.polygon.local",
-        });
+            Results = tmpResults,
+            NextUrl = null,
+            Status = "OK",
+        };
+
+        // Wrap in a Refit ApiResponse — the SDK Raw variant returns this
+        // wrapper. Use the in-source HttpResponseMessage helper so the
+        // status code is 200.
+        tmpStubService
+            .GetListContractsRawAsync(Arg.Any<GetListContractsRequest>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(MakeOkResponse(tmpEnvelope)));
 
         var tmpFetcher = new PolygonChainFetcher(
-            tmpHttp, tmpPolygonOpts, NullLogger<PolygonChainFetcher>.Instance);
+            tmpStubService, NullLogger<PolygonChainFetcher>.Instance);
 
         var tmpHistoryOpts = Options.Create(new HistoryServiceOptions
         {
@@ -138,7 +132,8 @@ public class OptionChainSmokeTests : IAsyncLifetime
         tmpCold.Contracts.Count.ShouldBe(2);
         tmpCold.IsMissMarker.ShouldBeFalse();
         tmpCold.CacheHit.ShouldBeFalse();
-        tmpHandler.CallCount.ShouldBe(1);
+        await tmpStubService.Received(1)
+            .GetListContractsRawAsync(Arg.Any<GetListContractsRequest>(), Arg.Any<CancellationToken>());
 
         // Provider's stable ORDER BY: strike, expiration, ticker.
         // Strike 240 (put) < strike 250 (call), so put comes first.
@@ -148,34 +143,34 @@ public class OptionChainSmokeTests : IAsyncLifetime
         tmpCold.Contracts[1].Ticker.ShouldBe("O:TSLA240105C00250000");
         tmpCold.Contracts[1].ContractType.ShouldBe("call");
 
-        // ---- 2. Warm — second call short-circuits, no Polygon hit ----
+        // ---- 2. Warm — second call short-circuits, stub NOT invoked again ----
         var tmpWarm = await tmpProvider.GetChainAsync("TSLA", tmpAsOf, CancellationToken.None);
 
         tmpWarm.Contracts.Count.ShouldBe(2);
         tmpWarm.CacheHit.ShouldBeTrue();
         tmpWarm.IsMissMarker.ShouldBeFalse();
-        tmpHandler.CallCount.ShouldBe(1);  // unchanged
+        await tmpStubService.Received(1)
+            .GetListContractsRawAsync(Arg.Any<GetListContractsRequest>(), Arg.Any<CancellationToken>());
     }
 
     /// <summary>
-    /// Returns a fixed JSON body to every request, counts calls.
+    /// Build a Refit <see cref="Refit.ApiResponse{T}"/> wrapping a 200/OK
+    /// HTTP response with the given parsed body. Refit's ApiResponse ctor
+    /// is internal in some versions but its constructor signature
+    /// (HttpResponseMessage, T?, RefitSettings, ApiException?) is the
+    /// supported way to fabricate one — and 0.10.0's Refit 10.1.6 exposes
+    /// it publicly.
     /// </summary>
-    private sealed class CountingStubHandler : HttpMessageHandler
+    private static Refit.ApiResponse<PolygonResponse<List<OptionsContract>>> MakeOkResponse(
+        PolygonResponse<List<OptionsContract>> inBody)
     {
-        private readonly string _body;
-        public int CallCount;
-
-        public CountingStubHandler(string body) => _body = body;
-
-        protected override Task<HttpResponseMessage> SendAsync(
-            HttpRequestMessage request, CancellationToken cancellationToken)
+        var tmpHttp = new HttpResponseMessage(System.Net.HttpStatusCode.OK)
         {
-            Interlocked.Increment(ref CallCount);
-            var resp = new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent(_body, Encoding.UTF8, "application/json"),
-            };
-            return Task.FromResult(resp);
-        }
+            RequestMessage = new HttpRequestMessage(
+                HttpMethod.Get,
+                new Uri("https://api.polygon.io/v3/reference/options/contracts")),
+        };
+        return new Refit.ApiResponse<PolygonResponse<List<OptionsContract>>>(
+            tmpHttp, inBody, new Refit.RefitSettings(), error: null);
     }
 }

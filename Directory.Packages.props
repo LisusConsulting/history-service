@@ -16,7 +16,11 @@
 
     <!-- HTTP / Polygon / FRED -->
     <PackageVersion Include="Microsoft.Extensions.Http" Version="10.0.5" />
-    <PackageVersion Include="TreyThomasCodes.Polygon.Models" Version="0.9.0" />
+    <!-- Phase E: published TreyThomasCodes.Polygon.* 0.9.0 NuGets dropped
+         in favour of <ProjectReference> on the polygon-net-client
+         submodule (external/polygon-net-client, pinned at 0.10.0 / 614a273).
+         Submodule csprojs carry their own Directory.Packages.props for
+         their transitive deps (Refit, FluentValidation, NodaTime). -->
 
     <!-- Microsoft.Extensions -->
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.5" />

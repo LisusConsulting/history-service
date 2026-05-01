@@ -1,21 +1,22 @@
-// Phase 1, micro-PR #1 — deployable shell only.
-//
-// Bootstraps the ASP.NET host with gRPC + reflection. Wires up the stub
-// HistoryServiceImpl whose RPCs all throw Unimplemented (lifted in PRs
-// #2-#7) and a real /health endpoint that proves the process is alive
-// and the postgres connection string is resolvable.
+// Phase 1, micro-PR #1 — deployable shell.
+// Phase E — refactored Polygon plumbing onto polygon-net-client SDK 0.10.0
+// (pluggable handler chain + Raw ApiResponse variants). The 3 Polygon
+// fetchers (bars, NBBO, chain) now consume IStocksService /
+// IOptionsService instead of raw HttpClient; SemaphoreSlim concurrency +
+// per-call timeout live in DelegatingHandlers layered into the SDK's
+// AddPolygonClient pipeline.
 
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
+using MomentumBreakoutDetector.HistoryService.MessageHandlers;
 using MomentumBreakoutDetector.HistoryService.Providers;
 using Serilog;
+using TreyThomasCodes.Polygon.RestClient.Extensions;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // --- Logging --------------------------------------------------------------
-// Serilog console sink. JSON formatter is overkill for Phase 1; a
-// structured-text formatter is fine until we plug in a log shipper.
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
     .Enrich.FromLogContext()
@@ -24,32 +25,52 @@ Log.Logger = new LoggerConfiguration()
 builder.Host.UseSerilog();
 
 // --- Configuration --------------------------------------------------------
-// History:* options bound from env vars and appsettings. Connection string
-// has a sensible compose-network default; CI / local dev will override.
 builder.Services.Configure<HistoryServiceOptions>(
     builder.Configuration.GetSection(HistoryServiceOptions.SectionName));
 
-// --- Providers / fetchers (micro-PR #3 — NBBO quotes) --------------------
-// In-memory NBBO cache + Polygon HTTP fetcher are singletons (process-wide
-// concurrency cap + connection pooling). The provider is scoped so each
-// gRPC call gets a fresh NpgsqlConnection.
-builder.Services.AddSingleton<NbboMemoryCache>();
-// Named HttpClient so the IHttpClientFactory infra (handler pooling /
-// rotation) is in play, while we keep the fetcher as a true process-wide
-// singleton — its SemaphoreSlim must not be re-created per call.
-builder.Services.AddHttpClient(nameof(PolygonNbboFetcher));
-builder.Services.AddSingleton<IPolygonNbboFetcher>(sp =>
+// --- Polygon SDK (Phase E) ------------------------------------------------
+// Replaces three previously-separate IHttpClientFactory bindings (the
+// "polygon" named client for bars + the typed PolygonChainFetcher /
+// PolygonNbboFetcher HttpClients) with one centralized SDK registration.
+//
+// Pipeline order (auth handler is added by AddPolygonClient first; our
+// handlers layer AFTER auth so they see authed requests + observe the
+// transport response):
+//   request  → auth → retry → timeout → concurrency → wire
+//   response ← auth ← retry ← timeout ← concurrency ← wire
+// Concurrency must be the innermost handler so the gate is held only
+// while the request is actually in flight (retries inside it count
+// against the same gate slot, which is fine — that's the per-fetch
+// budget the original SemaphoreSlim enforced).
+builder.Services.AddTransient<PolygonRetryHandler>();
+builder.Services.AddTransient<PerCallTimeoutHandler>();
+builder.Services.AddTransient<ConcurrencyLimitingHandler>();
+
+builder.Services.AddPolygonClient(o =>
 {
-    var httpFactory = sp.GetRequiredService<IHttpClientFactory>();
-    var http = httpFactory.CreateClient(nameof(PolygonNbboFetcher));
-    var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<HistoryServiceOptions>>();
-    var logger = sp.GetRequiredService<ILogger<PolygonNbboFetcher>>();
-    return new PolygonNbboFetcher(http, opts, logger);
-});
+    var opts = builder.Configuration
+        .GetSection(HistoryServiceOptions.SectionName)
+        .Get<HistoryServiceOptions>() ?? new HistoryServiceOptions();
+    o.ApiKey = opts.PolygonApiKey ?? string.Empty;
+    o.BaseUrl = string.IsNullOrWhiteSpace(opts.PolygonBaseUrl)
+        ? "https://api.polygon.io"
+        : opts.PolygonBaseUrl;
+}, b => b
+    .AddHttpMessageHandler<PolygonRetryHandler>()
+    .AddHttpMessageHandler<PerCallTimeoutHandler>()
+    .AddHttpMessageHandler<ConcurrencyLimitingHandler>());
+
+// --- Providers / fetchers (NBBO quotes — micro-PR #3) --------------------
+builder.Services.AddSingleton<NbboMemoryCache>();
+// Fetcher takes IOptionsService from the SDK; singleton because the
+// fetcher itself is stateless (concurrency state lives in the handler
+// chain, which is process-wide via the static gate in
+// ConcurrencyLimitingHandler).
+builder.Services.AddSingleton<IPolygonNbboFetcher, PolygonNbboFetcher>();
 builder.Services.AddScoped<IOptionQuotesProvider, OptionQuotesProvider>();
 
 // --- FRED / Macro (micro-PR #5) ------------------------------------------
-// Named HttpClient for FredFetcher so it picks up DI'd handlers + lifetime.
+// FRED is NOT a Polygon endpoint — it stays on the named HttpClient path.
 builder.Services.AddHttpClient(FredFetcher.HttpClientName, c =>
 {
     c.Timeout = TimeSpan.FromMilliseconds(FredFetcher.DefaultPerCallTimeoutMs * 2);
@@ -59,10 +80,6 @@ builder.Services.AddSingleton<IFredFetcher>(sp =>
     var logger = sp.GetRequiredService<ILogger<FredFetcher>>();
     var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
     var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
-    // Resolution order: History:FredApiKey config (env-var overridable as
-    // History__FredApiKey) → process-level FRED_API_KEY env var (handled
-    // by the fetcher's own fallback). FRED key is optional at startup —
-    // calls fail-quiet with a Warning if it's missing.
     return new FredFetcher(
         logger: logger,
         httpClientFactory: httpClientFactory,
@@ -77,17 +94,13 @@ builder.Services.AddScoped<IMacroDataProvider>(sp =>
 });
 
 // --- Option chains (micro-PR #4) -----------------------------------------
-// Polygon:* (ApiKey + BaseUrl) read from configuration / env (e.g. set
-// Polygon__ApiKey via docker compose) so the chain fetcher (and any other
-// Polygon-backed fetcher landing in sibling micro-PRs) can pull the secret
-// via IOptions<PolygonOptions>.
+// PolygonOptions still binds the Polygon:* configuration section because
+// existing deploys + smoke tests reference it; the SDK ignores it (its
+// ApiKey/BaseUrl come from AddPolygonClient above) but the section is
+// preserved for backward-compat with `Polygon__ApiKey` env var consumers.
 builder.Services.Configure<PolygonOptions>(
     builder.Configuration.GetSection(PolygonOptions.SectionName));
-
-// Typed HttpClient for the chain fetcher — IHttpClientFactory keeps the
-// underlying SocketsHttpHandler pooled and bounds DNS / TCP lifetimes.
-builder.Services.AddHttpClient<IPolygonChainFetcher, PolygonChainFetcher>();
-// Provider is scoped so each gRPC call gets a fresh NpgsqlConnection.
+builder.Services.AddSingleton<IPolygonChainFetcher, PolygonChainFetcher>();
 builder.Services.AddScoped<IOptionChainProvider, OptionChainProvider>();
 
 // --- gRPC -----------------------------------------------------------------
@@ -98,49 +111,19 @@ builder.Services.AddGrpc(options =>
 builder.Services.AddGrpcReflection();
 
 // --- Bars (micro-PR #2) ---------------------------------------------------
-// Polygon HTTP client: named "polygon" (matches PolygonBarFetcher.HttpClientName).
-// BaseAddress comes from options so tests can point it at a stub. We
-// disable the default HttpClient.Timeout (100s) — the fetcher applies its
-// own 3s linked-CTS ceiling per call, which is the correct knob for
-// "give up on this attempt and let the caller retry" semantics.
-builder.Services.AddTransient<PolygonRetryHandler>();
-builder.Services.AddHttpClient(PolygonBarFetcher.HttpClientName, (sp, client) =>
-{
-    var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
-    // PolygonBaseUrl is the shared knob with the NBBO fetcher (PR #3).
-    // Tests inject a localhost stub here; production leaves it null /
-    // empty and we fall back to the public Polygon host.
-    var baseUrl = string.IsNullOrWhiteSpace(opts.PolygonBaseUrl)
-        ? "https://api.polygon.io"
-        : opts.PolygonBaseUrl;
-    client.BaseAddress = new Uri(baseUrl);
-    // Hard-disable the default per-request timeout; per-call ceiling
-    // is enforced by the fetcher's linked CTS (3s default).
-    client.Timeout = Timeout.InfiniteTimeSpan;
-}).AddHttpMessageHandler<PolygonRetryHandler>();
-
-// Singleton fetcher (holds the SemaphoreSlim concurrency gate). Scoped
-// provider per request so each gRPC call gets its own DB connection
-// scope without conflicting with concurrent calls.
 builder.Services.AddSingleton<IPolygonBarFetcher, PolygonBarFetcher>();
 builder.Services.AddScoped<IHistoricalBarsProvider, HistoricalBarsProvider>();
 
 // --- App ------------------------------------------------------------------
 var app = builder.Build();
 
-// Map the gRPC stub (every RPC throws Unimplemented).
 app.MapGrpcService<HistoryServiceImpl>();
 
-// Reflection so `grpcurl -plaintext localhost:30005 list` works without
-// hand-feeding a .proto file.
 if (app.Environment.IsDevelopment())
 {
     app.MapGrpcReflectionService();
 }
 
-// Plain-HTTP health endpoint for the docker healthcheck and quick curl
-// probes. Returns version info so we can confirm the container picked up
-// the right git sha.
 app.MapGet("/health", (IServiceProvider sp) =>
 {
     var opts = sp.GetService<Microsoft.Extensions.Options.IOptions<HistoryServiceOptions>>()?.Value
@@ -155,9 +138,6 @@ app.MapGet("/health", (IServiceProvider sp) =>
         gitBranch = opts.GitBranch,
         buildTime = opts.BuildTime,
         serverTimeUtc = DateTime.UtcNow.ToString("O"),
-        // Phase 1 doesn't actually connect to postgres yet — that lands in
-        // PR #2 with the first provider lift. We just echo back the
-        // configured connection string host for sanity (no creds).
         configuredDbHost = ExtractDbHost(opts.ConnectionString),
     });
 });
@@ -167,7 +147,7 @@ app.MapGet("/", () => Results.Ok(new
     service = "mbd-history",
     docs = "see README.md and Protos/history.proto",
     health = "/health",
-    grpc = "every RPC currently returns Unimplemented (Phase 1, micro-PR #1)"
+    grpc = "GetBars / GetNbbo / GetOptionChain / GetMacro implemented; remaining RPCs Unimplemented"
 }));
 
 Log.Information("mbd-history starting on {Urls}", string.Join(", ", app.Urls));
