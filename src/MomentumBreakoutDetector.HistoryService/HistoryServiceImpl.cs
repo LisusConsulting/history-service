@@ -1,6 +1,8 @@
+using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using MomentumBreakoutDetector.HistoryService.Contracts.V1;
+using MomentumBreakoutDetector.HistoryService.Providers;
 
 namespace MomentumBreakoutDetector.HistoryService;
 
@@ -25,10 +27,14 @@ namespace MomentumBreakoutDetector.HistoryService;
 public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServiceBase
 {
     private readonly ILogger<HistoryServiceImpl> _logger;
+    private readonly IOptionQuotesProvider _quotes;
 
-    public HistoryServiceImpl(ILogger<HistoryServiceImpl> logger)
+    public HistoryServiceImpl(
+        ILogger<HistoryServiceImpl> logger,
+        IOptionQuotesProvider quotes)
     {
         _logger = logger;
+        _quotes = quotes;
     }
 
     public override Task<GetBarsResponse> GetBars(GetBarsRequest request, ServerCallContext context)
@@ -37,10 +43,48 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         throw new RpcException(new Status(StatusCode.Unimplemented, "TODO: micro-PR #2 — lift PolygonBarFetcher + bars provider."));
     }
 
-    public override Task<GetNbboResponse> GetNbbo(GetNbboRequest request, ServerCallContext context)
+    public override async Task<GetNbboResponse> GetNbbo(GetNbboRequest request, ServerCallContext context)
     {
-        _logger.LogInformation("GetNbbo called (stub) ticker={Ticker}", request.Ticker);
-        throw new RpcException(new Status(StatusCode.Unimplemented, "TODO: micro-PR #5 — lift NBBO fetcher + miss-marker provider."));
+        // Micro-PR #3 — NBBO quotes lift. Cache-first lookup with
+        // write-through; miss-markers prevent re-polling Polygon for
+        // known-empty (ticker, ts) pairs.
+        if (string.IsNullOrWhiteSpace(request.Ticker))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "ticker is required"));
+        }
+        if (request.Ts is null)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "ts is required"));
+        }
+
+        var tmpTsUtc = request.Ts.ToDateTime();
+        _logger.LogInformation("GetNbbo ticker={Ticker} ts={Ts:O}", request.Ticker, tmpTsUtc);
+
+        var tmpLookup = await _quotes
+            .GetAtOrBeforeAsync(request.Ticker, tmpTsUtc, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        var tmpResp = new GetNbboResponse
+        {
+            CacheHit = tmpLookup.CacheHit,
+            IsMissMarker = tmpLookup.IsMissMarker,
+        };
+        if (tmpLookup.Quote is { } q)
+        {
+            tmpResp.Quote = new NbboQuote
+            {
+                Ticker = q.Ticker,
+                RequestedTs = Timestamp.FromDateTime(DateTime.SpecifyKind(q.RequestedTsUtc, DateTimeKind.Utc)),
+                AsOfTs = Timestamp.FromDateTime(DateTime.SpecifyKind(q.AsOfTsUtc, DateTimeKind.Utc)),
+                BidPrice = (double)q.BidPrice,
+                AskPrice = (double)q.AskPrice,
+                BidSize = q.BidSize ?? 0,
+                AskSize = q.AskSize ?? 0,
+                BidExchange = q.BidExchange ?? 0,
+                AskExchange = q.AskExchange ?? 0,
+            };
+        }
+        return tmpResp;
     }
 
     public override Task<GetOptionChainResponse> GetOptionChain(GetOptionChainRequest request, ServerCallContext context)

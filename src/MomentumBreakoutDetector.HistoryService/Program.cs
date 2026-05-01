@@ -6,6 +6,8 @@
 // and the postgres connection string is resolvable.
 
 using MomentumBreakoutDetector.HistoryService;
+using MomentumBreakoutDetector.HistoryService.Fetchers;
+using MomentumBreakoutDetector.HistoryService.Providers;
 using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -25,6 +27,25 @@ builder.Host.UseSerilog();
 // has a sensible compose-network default; CI / local dev will override.
 builder.Services.Configure<HistoryServiceOptions>(
     builder.Configuration.GetSection(HistoryServiceOptions.SectionName));
+
+// --- Providers / fetchers (micro-PR #3 — NBBO quotes) --------------------
+// In-memory NBBO cache + Polygon HTTP fetcher are singletons (process-wide
+// concurrency cap + connection pooling). The provider is scoped so each
+// gRPC call gets a fresh NpgsqlConnection.
+builder.Services.AddSingleton<NbboMemoryCache>();
+// Named HttpClient so the IHttpClientFactory infra (handler pooling /
+// rotation) is in play, while we keep the fetcher as a true process-wide
+// singleton — its SemaphoreSlim must not be re-created per call.
+builder.Services.AddHttpClient(nameof(PolygonNbboFetcher));
+builder.Services.AddSingleton<IPolygonNbboFetcher>(sp =>
+{
+    var httpFactory = sp.GetRequiredService<IHttpClientFactory>();
+    var http = httpFactory.CreateClient(nameof(PolygonNbboFetcher));
+    var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<HistoryServiceOptions>>();
+    var logger = sp.GetRequiredService<ILogger<PolygonNbboFetcher>>();
+    return new PolygonNbboFetcher(http, opts, logger);
+});
+builder.Services.AddScoped<IOptionQuotesProvider, OptionQuotesProvider>();
 
 // --- gRPC -----------------------------------------------------------------
 builder.Services.AddGrpc(options =>
