@@ -11,6 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Phase E: pull external/polygon-net-client submodule (pinned at
+          # 0.10.0 / 614a273) so the SDK projects referenced by the
+          # service csproj resolve at restore time.
+          submodules: recursive
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4

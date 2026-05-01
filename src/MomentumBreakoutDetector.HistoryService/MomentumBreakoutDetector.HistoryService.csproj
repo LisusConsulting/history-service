@@ -9,6 +9,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Phase E — expose internal helpers (ConcurrencyLimitingHandler.ResetGateForTests)
+         to the test assembly so the ConcurrencyLimitingHandlerTests can reset
+         the static gate to a known cap without polluting the production API. -->
+    <InternalsVisibleTo Include="MomentumBreakoutDetector.HistoryService.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Grpc.AspNetCore" />
     <PackageReference Include="Grpc.AspNetCore.Server.Reflection" />
     <PackageReference Include="Grpc.Tools">
@@ -21,7 +28,6 @@
     <PackageReference Include="Dapper" />
 
     <PackageReference Include="Microsoft.Extensions.Http" />
-    <PackageReference Include="TreyThomasCodes.Polygon.Models" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Microsoft.Extensions.Options" />
     <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
@@ -40,6 +46,17 @@
     <Protobuf Include="..\MomentumBreakoutDetector.HistoryService.Contracts\Protos\history.proto"
               GrpcServices="Server"
               Link="Protos/history.proto" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Phase E: source-level reference to the polygon-net-client SDK
+         (0.10.0). Replaces the published TreyThomasCodes.Polygon.Models /
+         RestClient NuGets so we can use the new pluggable handler chain
+         (AddPolygonClient(o, builder => ...)) and the Raw ApiResponse
+         variants exposed for body-level inspection of Polygon's
+         "200 + status:ERROR" quirk. Pin: 614a273. -->
+    <ProjectReference Include="..\..\external\polygon-net-client\TreyThomasCodes.Polygon.Models\TreyThomasCodes.Polygon.Models.csproj" />
+    <ProjectReference Include="..\..\external\polygon-net-client\TreyThomasCodes.Polygon.RestClient\TreyThomasCodes.Polygon.RestClient.csproj" />
   </ItemGroup>
 
 </Project>

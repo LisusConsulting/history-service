@@ -1,29 +1,36 @@
 using System.Net;
-using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Domain;
+using Refit;
+using TreyThomasCodes.Polygon.Models.Common;
+using TreyThomasCodes.Polygon.Models.Stocks;
+using TreyThomasCodes.Polygon.RestClient.Requests.Stocks;
+using TreyThomasCodes.Polygon.RestClient.Services;
 
 namespace MomentumBreakoutDetector.HistoryService.Fetchers;
 
 /// <summary>
-/// On-demand Polygon /v2/aggs bar fetch with per-call timeout and
-/// concurrency cap. Lifted from MBD's
-/// `MomentumBreakoutDetector.Infrastructure.Data.PolygonBarFetcher`
-/// (PR #129) and refactored to use a plain named HttpClient ("polygon")
-/// instead of the vendored TreyThomasCodes.Polygon SDK so the new
-/// service has no compile-time dep on MBD code.
+/// On-demand Polygon /v2/aggs bar fetch. Phase E: refactored from raw
+/// HttpClient to the polygon-net-client SDK 0.10.0 (<see cref="IStocksService"/>).
+///
+/// Production semantics preserved verbatim:
+///   - Per-call timeout — moved to <c>PerCallTimeoutHandler</c> in the
+///     SDK's HTTP pipeline (see Program.cs DI wiring).
+///   - Concurrency cap — moved to <c>ConcurrencyLimitingHandler</c> in the
+///     SDK's HTTP pipeline.
+///   - Fail-quiet on 401/403/404/429 — return empty list (caller writes a
+///     miss marker). The SDK translates non-success into
+///     <c>PolygonApiException</c>; we use the Raw variant
+///     (<c>GetBarsRawAsync</c>) so we can inspect <see cref="HttpStatusCode"/>
+///     directly + sniff the body for Polygon's "200 + status:NOT_AUTHORIZED"
+///     quirk.
+///   - Fail-loud on 5xx / network / timeout — propagate so the caller
+///     surfaces as BacktestFailed.
 ///
 /// Range-fetch shape: a single Polygon /v2/aggs call returns bars for a
 /// [from, to] window, so a single fetch closes a contiguous gap. Gap
-/// detection happens upstream in HistoricalBarsProvider — by the time we
-/// get here the caller has already determined "this range is missing".
-///
-/// Boundedness: the fetch budget abstraction was removed 2026-05-01
-/// (MBD PR #133). Determinism + idempotent cache writes + miss-marker
-/// tables bound the total work to exactly the missing data for the
-/// window; the rate limiter (3s timeout + SemaphoreSlim(8)) bounds
-/// concurrent dollar-cost.
+/// detection happens upstream in HistoricalBarsProvider.
 /// </summary>
 public interface IPolygonBarFetcher
 {
@@ -41,62 +48,42 @@ public interface IPolygonBarFetcher
 
 public sealed class PolygonBarFetcher : IPolygonBarFetcher
 {
-    private readonly IHttpClientFactory m_HttpClientFactory;
+    private readonly IStocksService m_Stocks;
     private readonly ILogger<PolygonBarFetcher> m_Logger;
-    private readonly SemaphoreSlim m_FetchConcurrencyGate;
-    private readonly int m_PerCallTimeoutMs;
-    private readonly string m_ApiKey;
-
-    /// <summary>HTTP client name registered in DI for Polygon /v2/aggs calls.</summary>
-    public const string HttpClientName = "polygon";
 
     /// <summary>
-    /// Default per-call ceiling on a single Polygon /v2/aggs lookup
-    /// (mirror of MBD PolygonBarFetcher.DefaultPerCallTimeoutMs = 3s).
-    /// 5d of 1-min TSLA bars is ~1900 rows × ~80B = ~150KB so 3s is
-    /// plenty under normal latency.
+    /// Default per-call ceiling. Now enforced by <c>PerCallTimeoutHandler</c>
+    /// in the SDK pipeline; kept as a const for backwards-compat readers.
     /// </summary>
     public const int DefaultPerCallTimeoutMs = 3000;
 
     /// <summary>
-    /// Default concurrency cap on in-flight Polygon bar fetches.
-    /// Polygon's plan permits ~100 req/sec; with timeout=3s and
-    /// MaxConcurrent=8 the pessimistic ceiling is ~2.7 fetches/sec.
+    /// Default concurrency cap. Now enforced by
+    /// <c>ConcurrencyLimitingHandler</c> in the SDK pipeline.
     /// </summary>
     public const int DefaultMaxConcurrentFetches = 8;
 
     public PolygonBarFetcher(
-        IHttpClientFactory inHttpClientFactory,
-        IOptions<HistoryServiceOptions> inOptions,
+        IStocksService inStocks,
         ILogger<PolygonBarFetcher> inLogger)
-        : this(
-            inHttpClientFactory,
-            inLogger,
-            // PolygonApiKey is shared with the NBBO fetcher (micro-PR #3).
-            // Both speak to the same Polygon plan, same key.
-            inOptions.Value.PolygonApiKey ?? string.Empty,
-            inOptions.Value.PolygonPerCallTimeoutMs > 0 ? inOptions.Value.PolygonPerCallTimeoutMs : DefaultPerCallTimeoutMs,
-            inOptions.Value.PolygonMaxConcurrentFetches > 0 ? inOptions.Value.PolygonMaxConcurrentFetches : DefaultMaxConcurrentFetches)
     {
+        m_Stocks = inStocks;
+        m_Logger = inLogger;
     }
 
     /// <summary>
-    /// Test-friendly ctor that accepts the API key + tuning directly so
-    /// integration tests can wire up a stub without binding options.
+    /// IOptions overload retained for parity with the legacy ctor surface
+    /// — DI bindings and tests that previously bound an
+    /// <see cref="IOptions{HistoryServiceOptions}"/> still resolve.
+    /// The options bag is unused: timeouts + concurrency live in the
+    /// pipeline handlers now.
     /// </summary>
     public PolygonBarFetcher(
-        IHttpClientFactory inHttpClientFactory,
-        ILogger<PolygonBarFetcher> inLogger,
-        string inApiKey,
-        int inPerCallTimeoutMs = DefaultPerCallTimeoutMs,
-        int inMaxConcurrentFetches = DefaultMaxConcurrentFetches)
+        IStocksService inStocks,
+        IOptions<HistoryServiceOptions> _,
+        ILogger<PolygonBarFetcher> inLogger)
+        : this(inStocks, inLogger)
     {
-        m_HttpClientFactory = inHttpClientFactory;
-        m_Logger = inLogger;
-        m_ApiKey = inApiKey ?? string.Empty;
-        m_PerCallTimeoutMs = inPerCallTimeoutMs > 0 ? inPerCallTimeoutMs : DefaultPerCallTimeoutMs;
-        var tmpMaxCc = inMaxConcurrentFetches > 0 ? inMaxConcurrentFetches : DefaultMaxConcurrentFetches;
-        m_FetchConcurrencyGate = new SemaphoreSlim(tmpMaxCc, tmpMaxCc);
     }
 
     public async Task<IReadOnlyList<Bar>> FetchBarsAsync(
@@ -107,170 +94,153 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
 
         var (tmpMultiplier, tmpTimespan) = MapTimeframe(inTimeframe);
 
-        // Per-call ceiling + concurrency cap. Linked CTS aborts a single
-        // hung Polygon call without disturbing the caller's CT.
-        using var tmpTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(inCt);
-        tmpTimeoutCts.CancelAfter(m_PerCallTimeoutMs);
+        // Polygon's /v2/aggs accepts YYYY-MM-DD or unix-ms. Use ISO date
+        // for readability; query the inclusive range and post-filter the
+        // returned bars to [from, to] in UTC. Polygon interprets from/to
+        // in the asset's primary exchange timezone at request time, but
+        // the per-bar `t` (unix ms) is what we use for the actual bar
+        // boundary so off-by-one bars don't creep in.
+        var tmpFromStr = inFromUtc.ToString("yyyy-MM-dd");
+        var tmpToStr = inToUtc.ToString("yyyy-MM-dd");
 
-        await m_FetchConcurrencyGate.WaitAsync(inCt);
-        try
+        var tmpRequest = new GetBarsRequest
         {
-            // Polygon's /v2/aggs accepts YYYY-MM-DD or unix-ms. Use ISO
-            // date for readability; we query the inclusive range and
-            // post-filter the returned bars to [from, to] in UTC. Polygon
-            // interprets from/to in the asset's primary exchange timezone
-            // at request time, but the per-bar `t` (unix ms) is what we
-            // use for the actual bar boundary so off-by-one bars don't
-            // creep in.
-            var tmpFromStr = inFromUtc.ToString("yyyy-MM-dd");
-            var tmpToStr = inToUtc.ToString("yyyy-MM-dd");
-
-            var tmpUrl =
-                $"/v2/aggs/ticker/{Uri.EscapeDataString(inSymbol)}"
-                + $"/range/{tmpMultiplier}/{tmpTimespan}"
-                + $"/{tmpFromStr}/{tmpToStr}"
-                + $"?adjusted=true&sort=asc&limit=50000"
-                + $"&apiKey={Uri.EscapeDataString(m_ApiKey)}";
-
-            var tmpClient = m_HttpClientFactory.CreateClient(HttpClientName);
-            using var tmpResp = await tmpClient.GetAsync(tmpUrl, tmpTimeoutCts.Token);
-
-            // Auth / entitlement / not-found — treat as empty result
-            // (caller writes a miss marker). Same fail-quiet shape as the
-            // MBD original.
-            if (tmpResp.StatusCode == HttpStatusCode.Unauthorized
-                || tmpResp.StatusCode == HttpStatusCode.Forbidden)
-            {
-                m_Logger.LogInformation(
-                    "Bars NOT_AUTHORIZED ({Status}) for {Symbol} {Timeframe} {From}..{To} — outside plan history depth",
-                    tmpResp.StatusCode, inSymbol, inTimeframe, tmpFromStr, tmpToStr);
-                return Array.Empty<Bar>();
-            }
-            if (tmpResp.StatusCode == HttpStatusCode.NotFound)
-            {
-                m_Logger.LogInformation(
-                    "Bars 404 for {Symbol} {Timeframe} {From}..{To}",
-                    inSymbol, inTimeframe, tmpFromStr, tmpToStr);
-                return Array.Empty<Bar>();
-            }
-            if (tmpResp.StatusCode == HttpStatusCode.TooManyRequests)
-            {
-                // 429 — back off rather than fail-loud. Caller writes a
-                // miss-marker; subsequent runs hit the marker and skip
-                // re-fetch. Without this, a single rate-limit blip aborts
-                // a 30-day cold-start backtest.
-                m_Logger.LogWarning(
-                    "Bars 429 rate-limited for {Symbol} {Timeframe} {From}..{To} — treating as miss for this run",
-                    inSymbol, inTimeframe, tmpFromStr, tmpToStr);
-                return Array.Empty<Bar>();
-            }
-
-            tmpResp.EnsureSuccessStatusCode();
-
-            await using var tmpStream = await tmpResp.Content.ReadAsStreamAsync(tmpTimeoutCts.Token);
-            var tmpDoc = await JsonDocument.ParseAsync(tmpStream, cancellationToken: tmpTimeoutCts.Token);
-
-            // Polygon "NOT_AUTHORIZED" sometimes comes through as 200 +
-            // status="NOT_AUTHORIZED" in the body — handle that too.
-            if (tmpDoc.RootElement.TryGetProperty("status", out var tmpStatusEl)
-                && tmpStatusEl.ValueKind == JsonValueKind.String)
-            {
-                var tmpStatus = tmpStatusEl.GetString();
-                if (string.Equals(tmpStatus, "NOT_AUTHORIZED", StringComparison.OrdinalIgnoreCase))
-                {
-                    m_Logger.LogInformation(
-                        "Bars NOT_AUTHORIZED (200/body) for {Symbol} {Timeframe} {From}..{To}",
-                        inSymbol, inTimeframe, tmpFromStr, tmpToStr);
-                    return Array.Empty<Bar>();
-                }
-            }
-
-            if (!tmpDoc.RootElement.TryGetProperty("results", out var tmpResults)
-                || tmpResults.ValueKind != JsonValueKind.Array
-                || tmpResults.GetArrayLength() == 0)
-            {
-                m_Logger.LogInformation(
-                    "Polygon /v2/aggs returned 0 bars for {Symbol} {Timeframe} {From}..{To}",
-                    inSymbol, inTimeframe, tmpFromStr, tmpToStr);
-                return Array.Empty<Bar>();
-            }
-
-            var tmpBars = new List<Bar>(tmpResults.GetArrayLength());
-            foreach (var tmpAgg in tmpResults.EnumerateArray())
-            {
-                if (!TryGetLong(tmpAgg, "t", out var tmpTs)) continue;
-                if (!TryGetDecimal(tmpAgg, "o", out var tmpOpen)) continue;
-                if (!TryGetDecimal(tmpAgg, "h", out var tmpHigh)) continue;
-                if (!TryGetDecimal(tmpAgg, "l", out var tmpLow)) continue;
-                if (!TryGetDecimal(tmpAgg, "c", out var tmpClose)) continue;
-                if (!TryGetDecimal(tmpAgg, "v", out var tmpVolume)) continue;
-                TryGetDecimal(tmpAgg, "vw", out var tmpVwap); // optional
-
-                var tmpTsUtc = DateTimeOffset.FromUnixTimeMilliseconds(tmpTs).UtcDateTime;
-                // Post-filter to the requested UTC range. Polygon's
-                // date-string request includes the full asset-tz day, so
-                // an inclusive UTC [from, to] needs explicit clipping.
-                if (tmpTsUtc < inFromUtc || tmpTsUtc > inToUtc) continue;
-
-                tmpBars.Add(new Bar(
-                    Symbol: inSymbol,
-                    Timestamp: tmpTsUtc,
-                    Open: tmpOpen,
-                    High: tmpHigh,
-                    Low: tmpLow,
-                    Close: tmpClose,
-                    Volume: tmpVolume,
-                    VWAP: tmpVwap));
-            }
-
-            m_Logger.LogInformation(
-                "Polygon on-demand fetch: {Count} {Timeframe} bars for {Symbol} {From}..{To}",
-                tmpBars.Count, inTimeframe, inSymbol, tmpFromStr, tmpToStr);
-            return tmpBars;
-        }
-        catch (OperationCanceledException) when (tmpTimeoutCts.IsCancellationRequested
-                                                 && !inCt.IsCancellationRequested)
-        {
-            // Per-call timeout — fail loud so the engine surfaces it.
-            // Better to fail loud than silently mis-model.
-            m_Logger.LogError(
-                "Polygon /v2/aggs timed out after {TimeoutMs}ms for {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd}",
-                m_PerCallTimeoutMs, inSymbol, inTimeframe, inFromUtc, inToUtc);
-            throw new TimeoutException(
-                $"Polygon /v2/aggs timed out after {m_PerCallTimeoutMs}ms for "
-                + $"{inSymbol} {inTimeframe} {inFromUtc:yyyy-MM-dd}..{inToUtc:yyyy-MM-dd}");
-        }
-        finally
-        {
-            m_FetchConcurrencyGate.Release();
-        }
-    }
-
-    /// <summary>Map BarTimeframe to Polygon (multiplier, timespan).</summary>
-    private static (int Multiplier, string Timespan) MapTimeframe(BarTimeframe inTimeframe)
-        => inTimeframe switch
-        {
-            BarTimeframe.OneMinute => (1, "minute"),
-            BarTimeframe.FiveMinutes => (5, "minute"),
-            BarTimeframe.FifteenMinutes => (15, "minute"),
-            BarTimeframe.OneHour => (1, "hour"),
-            BarTimeframe.OneDay => (1, "day"),
-            _ => (1, "minute")
+            Ticker = inSymbol,
+            Multiplier = tmpMultiplier,
+            Timespan = tmpTimespan,
+            From = tmpFromStr,
+            To = tmpToStr,
+            Adjusted = true,
+            Sort = SortOrder.Ascending,
+            Limit = 50000,
         };
 
-    private static bool TryGetLong(JsonElement inObj, string inProp, out long outValue)
-    {
-        outValue = 0;
-        if (!inObj.TryGetProperty(inProp, out var tmpEl)) return false;
-        if (tmpEl.ValueKind != JsonValueKind.Number) return false;
-        return tmpEl.TryGetInt64(out outValue);
+        ApiResponse<PolygonResponse<List<StockBar>>> tmpResp;
+        try
+        {
+            // Raw variant exposes the underlying HttpResponseMessage so we
+            // can fail-quiet on 4xx without the SDK throwing
+            // PolygonApiException. Concurrency + per-call timeout are
+            // applied by the pipeline handlers.
+            tmpResp = await m_Stocks.GetBarsRawAsync(tmpRequest, inCt).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            // PerCallTimeoutHandler throws this when the per-call ceiling
+            // fires. Fail-loud so the engine surfaces it.
+            m_Logger.LogError(ex,
+                "Polygon /v2/aggs timed out for {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd}",
+                inSymbol, inTimeframe, inFromUtc, inToUtc);
+            throw;
+        }
+
+        // Auth / entitlement / not-found / rate-limit — treat as empty
+        // result (caller writes a miss marker).
+        if (tmpResp.StatusCode == HttpStatusCode.Unauthorized
+            || tmpResp.StatusCode == HttpStatusCode.Forbidden)
+        {
+            m_Logger.LogInformation(
+                "Bars NOT_AUTHORIZED ({Status}) for {Symbol} {Timeframe} {From}..{To} — outside plan history depth",
+                tmpResp.StatusCode, inSymbol, inTimeframe, tmpFromStr, tmpToStr);
+            return Array.Empty<Bar>();
+        }
+        if (tmpResp.StatusCode == HttpStatusCode.NotFound)
+        {
+            m_Logger.LogInformation(
+                "Bars 404 for {Symbol} {Timeframe} {From}..{To}",
+                inSymbol, inTimeframe, tmpFromStr, tmpToStr);
+            return Array.Empty<Bar>();
+        }
+        if (tmpResp.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            // 429 — back off rather than fail-loud. Caller writes a
+            // miss-marker; subsequent runs hit the marker and skip
+            // re-fetch.
+            m_Logger.LogWarning(
+                "Bars 429 rate-limited for {Symbol} {Timeframe} {From}..{To} — treating as miss for this run",
+                inSymbol, inTimeframe, tmpFromStr, tmpToStr);
+            return Array.Empty<Bar>();
+        }
+
+        if (!tmpResp.IsSuccessStatusCode)
+        {
+            // 5xx + everything else — fail loud. ApiResponse exposes the
+            // underlying ApiException via Error; throwing it preserves
+            // the SDK's typed exception surface for the caller.
+            if (tmpResp.Error is not null) throw tmpResp.Error;
+            throw new HttpRequestException(
+                $"Polygon /v2/aggs returned {(int)tmpResp.StatusCode} {tmpResp.StatusCode}");
+        }
+
+        var tmpBody = tmpResp.Content;
+
+        // Polygon "NOT_AUTHORIZED" sometimes comes through as 200 +
+        // body.status="NOT_AUTHORIZED" / "ERROR" — handle that.
+        if (tmpBody is not null
+            && (string.Equals(tmpBody.Status, "NOT_AUTHORIZED", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(tmpBody.Status, "ERROR", StringComparison.OrdinalIgnoreCase)))
+        {
+            m_Logger.LogInformation(
+                "Bars 200/body status={Status} for {Symbol} {Timeframe} {From}..{To}",
+                tmpBody.Status, inSymbol, inTimeframe, tmpFromStr, tmpToStr);
+            return Array.Empty<Bar>();
+        }
+
+        var tmpResults = tmpBody?.Results;
+        if (tmpResults is null || tmpResults.Count == 0)
+        {
+            m_Logger.LogInformation(
+                "Polygon /v2/aggs returned 0 bars for {Symbol} {Timeframe} {From}..{To}",
+                inSymbol, inTimeframe, tmpFromStr, tmpToStr);
+            return Array.Empty<Bar>();
+        }
+
+        var tmpBars = new List<Bar>(tmpResults.Count);
+        foreach (var tmpAgg in tmpResults)
+        {
+            if (tmpAgg.Timestamp is null
+                || tmpAgg.Open is null || tmpAgg.High is null
+                || tmpAgg.Low is null || tmpAgg.Close is null
+                || tmpAgg.Volume is null)
+            {
+                continue;
+            }
+
+            var tmpTsUtc = DateTimeOffset
+                .FromUnixTimeMilliseconds((long)tmpAgg.Timestamp.Value)
+                .UtcDateTime;
+
+            // Post-filter to the requested UTC range. Polygon's
+            // date-string request includes the full asset-tz day, so an
+            // inclusive UTC [from, to] needs explicit clipping.
+            if (tmpTsUtc < inFromUtc || tmpTsUtc > inToUtc) continue;
+
+            tmpBars.Add(new Bar(
+                Symbol: inSymbol,
+                Timestamp: tmpTsUtc,
+                Open: tmpAgg.Open.Value,
+                High: tmpAgg.High.Value,
+                Low: tmpAgg.Low.Value,
+                Close: tmpAgg.Close.Value,
+                Volume: (decimal)tmpAgg.Volume.Value,
+                VWAP: tmpAgg.VolumeWeightedAveragePrice ?? 0m));
+        }
+
+        m_Logger.LogInformation(
+            "Polygon on-demand fetch: {Count} {Timeframe} bars for {Symbol} {From}..{To}",
+            tmpBars.Count, inTimeframe, inSymbol, tmpFromStr, tmpToStr);
+        return tmpBars;
     }
 
-    private static bool TryGetDecimal(JsonElement inObj, string inProp, out decimal outValue)
-    {
-        outValue = 0m;
-        if (!inObj.TryGetProperty(inProp, out var tmpEl)) return false;
-        if (tmpEl.ValueKind != JsonValueKind.Number) return false;
-        return tmpEl.TryGetDecimal(out outValue);
-    }
+    /// <summary>Map BarTimeframe to Polygon (multiplier, AggregateInterval).</summary>
+    private static (int Multiplier, AggregateInterval Timespan) MapTimeframe(BarTimeframe inTimeframe)
+        => inTimeframe switch
+        {
+            BarTimeframe.OneMinute => (1, AggregateInterval.Minute),
+            BarTimeframe.FiveMinutes => (5, AggregateInterval.Minute),
+            BarTimeframe.FifteenMinutes => (15, AggregateInterval.Minute),
+            BarTimeframe.OneHour => (1, AggregateInterval.Hour),
+            BarTimeframe.OneDay => (1, AggregateInterval.Day),
+            _ => (1, AggregateInterval.Minute)
+        };
 }
