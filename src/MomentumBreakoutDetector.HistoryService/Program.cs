@@ -97,6 +97,34 @@ builder.Services.AddGrpc(options =>
 });
 builder.Services.AddGrpcReflection();
 
+// --- Bars (micro-PR #2) ---------------------------------------------------
+// Polygon HTTP client: named "polygon" (matches PolygonBarFetcher.HttpClientName).
+// BaseAddress comes from options so tests can point it at a stub. We
+// disable the default HttpClient.Timeout (100s) — the fetcher applies its
+// own 3s linked-CTS ceiling per call, which is the correct knob for
+// "give up on this attempt and let the caller retry" semantics.
+builder.Services.AddTransient<PolygonRetryHandler>();
+builder.Services.AddHttpClient(PolygonBarFetcher.HttpClientName, (sp, client) =>
+{
+    var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
+    // PolygonBaseUrl is the shared knob with the NBBO fetcher (PR #3).
+    // Tests inject a localhost stub here; production leaves it null /
+    // empty and we fall back to the public Polygon host.
+    var baseUrl = string.IsNullOrWhiteSpace(opts.PolygonBaseUrl)
+        ? "https://api.polygon.io"
+        : opts.PolygonBaseUrl;
+    client.BaseAddress = new Uri(baseUrl);
+    // Hard-disable the default per-request timeout; per-call ceiling
+    // is enforced by the fetcher's linked CTS (3s default).
+    client.Timeout = Timeout.InfiniteTimeSpan;
+}).AddHttpMessageHandler<PolygonRetryHandler>();
+
+// Singleton fetcher (holds the SemaphoreSlim concurrency gate). Scoped
+// provider per request so each gRPC call gets its own DB connection
+// scope without conflicting with concurrent calls.
+builder.Services.AddSingleton<IPolygonBarFetcher, PolygonBarFetcher>();
+builder.Services.AddScoped<IHistoricalBarsProvider, HistoricalBarsProvider>();
+
 // --- App ------------------------------------------------------------------
 var app = builder.Build();
 
