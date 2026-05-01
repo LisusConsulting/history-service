@@ -19,4 +19,23 @@ public sealed class HistoryServiceOptions
     public string GitCommit { get; set; } = "unknown";
     public string GitBranch { get; set; } = "unknown";
     public string BuildTime { get; set; } = "unknown";
+
+    // ── Polygon NBBO fetcher (micro-PR #3) ────────────────────────────────
+    /// <summary>Polygon API key. Read from <c>History__PolygonApiKey</c> env var.</summary>
+    public string? PolygonApiKey { get; set; }
+
+    /// <summary>Override the Polygon base URL. Tests inject a stub URL here.</summary>
+    public string? PolygonBaseUrl { get; set; }
+
+    /// <summary>Per-call Polygon timeout in ms. Default 3000 (mirrors MBD PR #110).</summary>
+    public int PolygonPerCallTimeoutMs { get; set; } = 3000;
+
+    /// <summary>Process-wide concurrency cap on in-flight Polygon NBBO calls. Default 8.</summary>
+    public int PolygonMaxConcurrentFetches { get; set; } = 8;
+
+    /// <summary>
+    /// Freshness window (seconds) for the at-or-before fuzzy NBBO match.
+    /// Default 300 (5 minutes), as per MBD PR #98 rationale.
+    /// </summary>
+    public int NbboStaleQuoteToleranceSeconds { get; set; } = 300;
 }
