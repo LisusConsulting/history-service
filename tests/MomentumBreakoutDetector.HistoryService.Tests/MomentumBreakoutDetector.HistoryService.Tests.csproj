@@ -18,13 +18,21 @@
     <PackageReference Include="Shouldly" />
     <PackageReference Include="Testcontainers" />
     <PackageReference Include="Testcontainers.PostgreSql" />
+    <!-- micro-PR #2 (bars) + #3 (NBBO) — Testcontainers tests apply
+         schema inline (rather than mounting migration .sql files) so
+         the test stays hermetic. Dapper for the helpers and Npgsql for
+         the testcontainer connection. -->
     <PackageReference Include="Npgsql" />
     <PackageReference Include="Dapper" />
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The Service project re-emits the proto with GrpcServices="Server"
+         (which includes message types). Referencing the Contracts project
+         here too would pull in a second copy of every message type under
+         the same namespace, tripping CS0433. The Service project is the
+         single source of truth for proto types in tests. -->
     <ProjectReference Include="..\..\src\MomentumBreakoutDetector.HistoryService\MomentumBreakoutDetector.HistoryService.csproj" />
-    <ProjectReference Include="..\..\src\MomentumBreakoutDetector.HistoryService.Contracts\MomentumBreakoutDetector.HistoryService.Contracts.csproj" />
   </ItemGroup>
 
 </Project>

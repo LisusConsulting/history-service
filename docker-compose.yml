@@ -46,6 +46,10 @@ services:
       # /health and the JSON banner are HTTP/1 on 8081.
       ASPNETCORE_ENVIRONMENT: "Development"
       History__ConnectionString: "Host=mbd-history-postgres;Port=5432;Database=mbd_history;Username=mbd;Password=mbd"
+      # Polygon REST API key. Source from .env / shell. Fetcher fail-quiets
+      # on 401/403 so an unset key surfaces as zero-bar responses + warn
+      # logs rather than a hard crash.
+      History__PolygonApiKey: ${POLYGON_API_KEY:-}
       History__GitCommit: ${GIT_COMMIT:-unknown}
       History__GitBranch: ${GIT_BRANCH:-unknown}
       History__BuildTime: ${BUILD_TIME:-unknown}

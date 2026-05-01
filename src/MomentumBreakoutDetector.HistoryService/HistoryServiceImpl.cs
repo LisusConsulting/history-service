@@ -3,48 +3,111 @@ using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using MomentumBreakoutDetector.HistoryService.Contracts.V1;
 using MomentumBreakoutDetector.HistoryService.Providers;
+using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTimeframe;
+using V1Bar = MomentumBreakoutDetector.HistoryService.Contracts.V1.Bar;
 
 namespace MomentumBreakoutDetector.HistoryService;
 
 /// <summary>
-/// Phase 1, micro-PR #1 stub. Every RPC throws
+/// Phase 1 in-progress. RPCs that have been lifted execute against
+/// real providers; everything else still throws
 /// <see cref="StatusCode.Unimplemented"/> so consumers see a clean,
 /// well-typed "not yet" rather than a 500.
 /// </summary>
 /// <remarks>
-/// Each method's TODO comment names the micro-PR that will lift the
-/// real implementation:
+/// Lifted in this revision:
 ///   <list type="bullet">
-///     <item>GetBars            → micro-PR #2 (PolygonBarFetcher + provider)</item>
-///     <item>GetMacro           → micro-PR #3 (FredFetcher + provider)</item>
-///     <item>GetOptionChain     → micro-PR #4 (PolygonChainFetcher + provider)</item>
-///     <item>GetNbbo            → micro-PR #5 (NBBO + miss-marker provider)</item>
-///     <item>GetCacheStats      → micro-PR #6 (SingleFlight coalescer + stats)</item>
-///     <item>EnsureRangeCached  → micro-PR #7 (warmup orchestrator)</item>
+///     <item>GetBars  → micro-PR #2 (PolygonBarFetcher + bars provider)</item>
+///     <item>GetNbbo  → micro-PR #3 (NBBO + miss-marker provider)</item>
+///     <item>GetMacro → micro-PR #5 (FredFetcher + macro provider)</item>
+///   </list>
+/// Still stubbed:
+///   <list type="bullet">
+///     <item>GetOptionChain     → micro-PR #4</item>
+///     <item>GetCacheStats      → micro-PR #6</item>
+///     <item>EnsureRangeCached  → micro-PR #7</item>
 ///   </list>
 /// micro-PR #8 builds out the Testcontainers integration test suite.
 /// </remarks>
 public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServiceBase
 {
     private readonly ILogger<HistoryServiceImpl> _logger;
+    private readonly IHistoricalBarsProvider _barsProvider;
     private readonly IOptionQuotesProvider _quotes;
     private readonly IMacroDataProvider? _macroProvider;
 
     public HistoryServiceImpl(
         ILogger<HistoryServiceImpl> logger,
+        IHistoricalBarsProvider barsProvider,
         IOptionQuotesProvider quotes,
         IMacroDataProvider? macroProvider = null)
     {
         _logger = logger;
+        _barsProvider = barsProvider;
         _quotes = quotes;
         _macroProvider = macroProvider;
     }
 
-    public override Task<GetBarsResponse> GetBars(GetBarsRequest request, ServerCallContext context)
+    public override async Task<GetBarsResponse> GetBars(GetBarsRequest request, ServerCallContext context)
     {
-        _logger.LogInformation("GetBars called (stub) symbol={Symbol}", request.Symbol);
-        throw new RpcException(new Status(StatusCode.Unimplemented, "TODO: micro-PR #2 — lift PolygonBarFetcher + bars provider."));
+        // Validate request shape — empty symbol or unspecified timeframe
+        // is a client error; surface it as InvalidArgument rather than
+        // silently returning zero bars.
+        if (string.IsNullOrWhiteSpace(request.Symbol))
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "symbol is required"));
+        if (request.FromTs is null || request.ToTs is null)
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "from_ts and to_ts are required"));
+        if (request.Timeframe == BarTimeframe.Unspecified)
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "timeframe is required"));
+
+        var fromUtc = request.FromTs.ToDateTime();
+        var toUtc = request.ToTs.ToDateTime();
+        var timeframe = MapTimeframe(request.Timeframe);
+
+        _logger.LogInformation(
+            "GetBars symbol={Symbol} timeframe={Timeframe} from={From:O} to={To:O}",
+            request.Symbol, timeframe, fromUtc, toUtc);
+
+        var result = await _barsProvider.GetBarsAsync(
+            request.Symbol, fromUtc, toUtc, timeframe, context.CancellationToken);
+
+        var response = new GetBarsResponse { CacheHit = result.CacheHit };
+        foreach (var bar in result.Bars)
+        {
+            response.Bars.Add(new V1Bar
+            {
+                Symbol = bar.Symbol,
+                Timestamp = Timestamp.FromDateTime(DateTime.SpecifyKind(bar.Timestamp, DateTimeKind.Utc)),
+                Open = (double)bar.Open,
+                High = (double)bar.High,
+                Low = (double)bar.Low,
+                Close = (double)bar.Close,
+                Volume = (double)bar.Volume,
+                Vwap = (double)bar.VWAP,
+                // trade_count not currently surfaced through the cache —
+                // historical_bars.trade_count is nullable and unset by
+                // the on-demand fetch path. Defaulted to 0 here; PR #8
+                // can wire it through once the schema is populated.
+                TradeCount = 0,
+            });
+        }
+        return response;
     }
+
+    /// <summary>
+    /// Map the proto BarTimeframe to the internal Domain enum.
+    /// 15-minute and 1-hour aren't present in the wire enum (the proto
+    /// only declares minute / 5-minute / day) — the warmup orchestrator
+    /// can extend the proto in a later PR if intermediate timeframes
+    /// become callable.
+    /// </summary>
+    private static DomainBarTimeframe MapTimeframe(BarTimeframe inWire) => inWire switch
+    {
+        BarTimeframe.Minute => DomainBarTimeframe.OneMinute,
+        BarTimeframe.FiveMinute => DomainBarTimeframe.FiveMinutes,
+        BarTimeframe.Day => DomainBarTimeframe.OneDay,
+        _ => DomainBarTimeframe.OneMinute,
+    };
 
     public override async Task<GetNbboResponse> GetNbbo(GetNbboRequest request, ServerCallContext context)
     {
