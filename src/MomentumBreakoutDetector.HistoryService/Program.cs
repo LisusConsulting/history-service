@@ -5,6 +5,7 @@
 // #2-#7) and a real /health endpoint that proves the process is alive
 // and the postgres connection string is resolvable.
 
+using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
 using MomentumBreakoutDetector.HistoryService.Providers;
@@ -46,6 +47,34 @@ builder.Services.AddSingleton<IPolygonNbboFetcher>(sp =>
     return new PolygonNbboFetcher(http, opts, logger);
 });
 builder.Services.AddScoped<IOptionQuotesProvider, OptionQuotesProvider>();
+
+// --- FRED / Macro (micro-PR #5) ------------------------------------------
+// Named HttpClient for FredFetcher so it picks up DI'd handlers + lifetime.
+builder.Services.AddHttpClient(FredFetcher.HttpClientName, c =>
+{
+    c.Timeout = TimeSpan.FromMilliseconds(FredFetcher.DefaultPerCallTimeoutMs * 2);
+});
+builder.Services.AddSingleton<IFredFetcher>(sp =>
+{
+    var logger = sp.GetRequiredService<ILogger<FredFetcher>>();
+    var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
+    var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
+    // Resolution order: History:FredApiKey config (env-var overridable as
+    // History__FredApiKey) → process-level FRED_API_KEY env var (handled
+    // by the fetcher's own fallback). FRED key is optional at startup —
+    // calls fail-quiet with a Warning if it's missing.
+    return new FredFetcher(
+        logger: logger,
+        httpClientFactory: httpClientFactory,
+        apiKey: string.IsNullOrWhiteSpace(opts.FredApiKey) ? null : opts.FredApiKey);
+});
+builder.Services.AddScoped<IMacroDataProvider>(sp =>
+{
+    var logger = sp.GetRequiredService<ILogger<MacroDataProvider>>();
+    var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
+    var fred = sp.GetRequiredService<IFredFetcher>();
+    return new MacroDataProvider(opts.ConnectionString, logger, fred);
+});
 
 // --- gRPC -----------------------------------------------------------------
 builder.Services.AddGrpc(options =>

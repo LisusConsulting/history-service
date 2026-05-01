@@ -16,6 +16,15 @@ public sealed class HistoryServiceOptions
     public string ConnectionString { get; set; } =
         "Host=mbd-history-postgres;Port=5432;Database=mbd_history;Username=mbd;Password=mbd";
 
+    /// <summary>
+    /// Optional FRED API key used by <c>FredFetcher</c> (micro-PR #5).
+    /// Resolved from <c>History:FredApiKey</c> in config (envvar
+    /// <c>History__FredApiKey</c> on Linux). When empty, the fetcher
+    /// falls back to the process-level <c>FRED_API_KEY</c> env var, then
+    /// fail-quiets with a warning if neither is set.
+    /// </summary>
+    public string? FredApiKey { get; set; }
+
     public string GitCommit { get; set; } = "unknown";
     public string GitBranch { get; set; } = "unknown";
     public string BuildTime { get; set; } = "unknown";
