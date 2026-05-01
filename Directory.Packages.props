@@ -16,6 +16,7 @@
 
     <!-- HTTP / Polygon / FRED -->
     <PackageVersion Include="Microsoft.Extensions.Http" Version="10.0.5" />
+    <PackageVersion Include="TreyThomasCodes.Polygon.Models" Version="0.9.0" />
 
     <!-- Microsoft.Extensions -->
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.5" />
