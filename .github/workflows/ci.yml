@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore HistoryService.slnx
+
+      - name: Build
+        run: dotnet build HistoryService.slnx --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test HistoryService.slnx --configuration Release --no-build --verbosity normal

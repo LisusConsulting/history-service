@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/MomentumBreakoutDetector.HistoryService/MomentumBreakoutDetector.HistoryService.csproj" />
+  <Project Path="src/MomentumBreakoutDetector.HistoryService.Contracts/MomentumBreakoutDetector.HistoryService.Contracts.csproj" />
+  <Project Path="tests/MomentumBreakoutDetector.HistoryService.Tests/MomentumBreakoutDetector.HistoryService.Tests.csproj" />
+</Solution>

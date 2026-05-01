@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MomentumBreakoutDetector.HistoryService.Contracts</RootNamespace>
+    <!-- Future: pack as NuGet for consumers. -->
+    <IsPackable>true</IsPackable>
+    <PackageId>MomentumBreakoutDetector.HistoryService.Contracts</PackageId>
+    <Description>gRPC client + protobuf contracts for the mbd-history service.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" />
+    <PackageReference Include="Grpc.Net.Client" />
+    <PackageReference Include="Grpc.Tools">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Protobuf Include="Protos/history.proto" GrpcServices="Client" />
+  </ItemGroup>
+
+</Project>

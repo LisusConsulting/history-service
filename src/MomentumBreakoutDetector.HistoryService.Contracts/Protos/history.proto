@@ -1,0 +1,241 @@
+syntax = "proto3";
+
+package mbd.history.v1;
+
+option csharp_namespace = "MomentumBreakoutDetector.HistoryService.Contracts.V1";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// HistoryService — single source of historical market data for MBD.
+//
+// Phase 1 contract. Consumers (backtest engine, live engine NBBO at order
+// time, AI service eventually) call this service instead of hitting Polygon
+// / FRED directly. The service owns:
+//   - bars (stock minute/day OHLCV)
+//   - NBBO option quotes (point-in-time bid/ask + sizes)
+//   - option chains (per as-of-date contract universe)
+//   - macro observations (FRED series)
+//   - miss markers (negative-result cache for cold-start determinism)
+//
+// Concurrency contract: every endpoint is single-flight by key —
+// concurrent identical requests coalesce to one upstream fetch.
+//
+// Backtest contract: consumers call EnsureRangeCached up-front (server
+// streams progress) before issuing point fetches. This is the batched
+// path. Point fetches still work mid-run for the live engine NBBO at
+// order time.
+//
+// Auth: TODO Phase 2 — M2M client_credentials against
+// https://sts.motuzko.com (scope: mbd-history). MVP is unauthenticated.
+// ============================================================================
+service HistoryService {
+  // ---- Point fetches (cache-first; on miss → upstream fetch + write-through).
+  rpc GetBars (GetBarsRequest) returns (GetBarsResponse);
+  rpc GetNbbo (GetNbboRequest) returns (GetNbboResponse);
+  rpc GetOptionChain (GetOptionChainRequest) returns (GetOptionChainResponse);
+  rpc GetMacro (GetMacroRequest) returns (GetMacroResponse);
+
+  // ---- Warmup. Server-streaming progress. Identifies missing keys for
+  // the requested range, batches upstream fetches, returns when the cache
+  // covers the full range. Idempotent: a second call on a fully-cached
+  // range completes in one progress event with status COMPLETED and zero
+  // upstream calls.
+  rpc EnsureRangeCached (EnsureRangeCachedRequest) returns (stream EnsureRangeCachedProgress);
+
+  // ---- Operability.
+  rpc GetCacheStats (GetCacheStatsRequest) returns (GetCacheStatsResponse);
+}
+
+// ----------------------------------------------------------------------------
+// Shared message types.
+// ----------------------------------------------------------------------------
+
+enum BarTimeframe {
+  BAR_TIMEFRAME_UNSPECIFIED = 0;
+  BAR_TIMEFRAME_MINUTE = 1;
+  BAR_TIMEFRAME_FIVE_MINUTE = 2;
+  BAR_TIMEFRAME_DAY = 3;
+}
+
+enum ContractType {
+  CONTRACT_TYPE_UNSPECIFIED = 0;
+  CONTRACT_TYPE_CALL = 1;
+  CONTRACT_TYPE_PUT = 2;
+}
+
+message Bar {
+  string symbol = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  double open = 3;
+  double high = 4;
+  double low = 5;
+  double close = 6;
+  double volume = 7;
+  double vwap = 8;
+  int32 trade_count = 9;
+}
+
+message NbboQuote {
+  string ticker = 1;                                  // O:TSLA241220C00250000
+  google.protobuf.Timestamp requested_ts = 2;         // ts the caller asked about
+  google.protobuf.Timestamp as_of_ts = 3;             // SIP timestamp the quote was published at
+  double bid_price = 4;
+  double ask_price = 5;
+  int32 bid_size = 6;
+  int32 ask_size = 7;
+  int32 bid_exchange = 8;
+  int32 ask_exchange = 9;
+  double underlying_price = 10;                       // sanity field — underlying close at the same minute
+}
+
+message OptionContract {
+  string ticker = 1;
+  string underlying_ticker = 2;
+  ContractType contract_type = 3;
+  string exercise_style = 4;                          // american | european
+  google.protobuf.Timestamp expiration_date = 5;
+  double strike_price = 6;
+  int32 shares_per_contract = 7;
+  string primary_exchange = 8;
+}
+
+message MacroObservation {
+  string series_id = 1;                               // VIXCLS, DGS10, etc.
+  google.protobuf.Timestamp observation_date = 2;
+  double value = 3;
+}
+
+// ----------------------------------------------------------------------------
+// GetBars — point fetch over a [from_ts, to_ts] range for one (symbol, timeframe).
+// ----------------------------------------------------------------------------
+message GetBarsRequest {
+  string symbol = 1;
+  BarTimeframe timeframe = 2;
+  google.protobuf.Timestamp from_ts = 3;
+  google.protobuf.Timestamp to_ts = 4;
+}
+
+message GetBarsResponse {
+  repeated Bar bars = 1;
+  bool cache_hit = 2;                                 // true iff zero upstream calls for this range
+}
+
+// ----------------------------------------------------------------------------
+// GetNbbo — point-in-time NBBO for one option contract at one timestamp.
+// ----------------------------------------------------------------------------
+message GetNbboRequest {
+  string ticker = 1;                                  // O:-prefixed
+  google.protobuf.Timestamp ts = 2;
+}
+
+message GetNbboResponse {
+  // Set iff a quote exists. Absent (null in C#) means a miss-marker is
+  // recorded for this (ticker, ts) — caller should NOT retry.
+  NbboQuote quote = 1;
+  bool cache_hit = 2;
+  bool is_miss_marker = 3;                            // true iff a recorded miss matched
+}
+
+// ----------------------------------------------------------------------------
+// GetOptionChain — contract universe for one (underlying, as_of_date).
+// ----------------------------------------------------------------------------
+message GetOptionChainRequest {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp as_of_date = 2;           // date — time component ignored
+
+  // Optional filters; empty / 0 = no filter.
+  ContractType contract_type = 3;
+  google.protobuf.Timestamp expiration_after = 4;
+  google.protobuf.Timestamp expiration_before = 5;
+  double strike_min = 6;
+  double strike_max = 7;
+}
+
+message GetOptionChainResponse {
+  repeated OptionContract contracts = 1;
+  bool cache_hit = 2;
+  bool is_miss_marker = 3;
+}
+
+// ----------------------------------------------------------------------------
+// GetMacro — FRED observations for one series over a date range.
+// ----------------------------------------------------------------------------
+message GetMacroRequest {
+  string series_id = 1;
+  google.protobuf.Timestamp from_date = 2;
+  google.protobuf.Timestamp to_date = 3;
+}
+
+message GetMacroResponse {
+  repeated MacroObservation observations = 1;
+  bool cache_hit = 2;
+}
+
+// ----------------------------------------------------------------------------
+// EnsureRangeCached — warmup. Server-streaming progress.
+// Caller picks one or more data classes; service identifies gaps, fans out
+// batched upstream fetches, and streams progress until done.
+// ----------------------------------------------------------------------------
+enum DataClass {
+  DATA_CLASS_UNSPECIFIED = 0;
+  DATA_CLASS_BARS = 1;
+  DATA_CLASS_NBBO = 2;
+  DATA_CLASS_CHAINS = 3;
+  DATA_CLASS_MACRO = 4;
+}
+
+enum WarmupStatus {
+  WARMUP_STATUS_UNSPECIFIED = 0;
+  WARMUP_STATUS_PLANNING = 1;                         // gap-detection in progress
+  WARMUP_STATUS_FETCHING = 2;                         // batched upstream calls in flight
+  WARMUP_STATUS_COMPLETED = 3;                        // cache covers requested range
+  WARMUP_STATUS_FAILED = 4;                           // unrecoverable upstream failure
+}
+
+message EnsureRangeCachedRequest {
+  // Symbols / tickers / series ids the caller wants warmed.
+  repeated string symbols = 1;
+  // Which data classes to warm. Multiple classes share one warmup task so
+  // a backtest can issue one EnsureRangeCached for everything it needs.
+  repeated DataClass data_classes = 2;
+  google.protobuf.Timestamp from_ts = 3;
+  google.protobuf.Timestamp to_ts = 4;
+
+  // Per-class hints. Optional.
+  BarTimeframe bar_timeframe = 5;
+}
+
+message EnsureRangeCachedProgress {
+  WarmupStatus status = 1;
+  int32 keys_total = 2;                               // total minute keys / dates expected to cover
+  int32 keys_complete = 3;                            // keys present in cache (hit) or just fetched
+  int32 keys_missing = 4;                             // keys still pending fetch
+  int32 upstream_calls = 5;                           // batched upstream calls issued so far
+  string message = 6;                                 // human-readable status, optional
+}
+
+// ----------------------------------------------------------------------------
+// Cache stats — operational metrics.
+// ----------------------------------------------------------------------------
+message GetCacheStatsRequest {
+  // Optional class filter; empty = aggregate across all.
+  DataClass data_class = 1;
+}
+
+message ClassStats {
+  DataClass data_class = 1;
+  int64 total_requests = 2;
+  int64 cache_hits = 3;
+  int64 upstream_fetches = 4;
+  int64 miss_markers = 5;
+  int32 in_flight_count = 6;
+  double latency_p50_ms = 7;
+  double latency_p95_ms = 8;
+  double latency_p99_ms = 9;
+}
+
+message GetCacheStatsResponse {
+  repeated ClassStats class_stats = 1;
+  google.protobuf.Timestamp as_of = 2;
+}

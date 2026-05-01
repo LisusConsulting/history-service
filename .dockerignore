@@ -1,0 +1,29 @@
+# Build artifacts
+**/bin/
+**/obj/
+**/out/
+**/publish/
+**/TestResults/
+**/Generated/
+
+# IDE / VCS
+.git/
+.vs/
+.vscode/
+.idea/
+.github/
+
+# Tests aren't built into the image
+tests/
+
+# Docs / migrations / local tooling
+docs/
+README.md
+docker-compose.yml
+.editorconfig
+.gitignore
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db

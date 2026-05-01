@@ -1,0 +1,66 @@
+name: mbd-history
+
+# Phase 1 micro-PR #1 — deployable shell.
+# Two services: a TimescaleDB postgres for cache storage and the .NET
+# gRPC service itself. Ports avoid collisions with the dev (15432 / 10005)
+# and paper (25433 / 20005) clones of MBD running on the same host.
+
+services:
+  mbd-history-postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: mbd-history-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mbd
+      POSTGRES_PASSWORD: mbd
+      POSTGRES_DB: mbd_history
+    ports:
+      # 35432 host -> 5432 container. Avoids dev (15432) / paper (25433).
+      - "35432:5432"
+    volumes:
+      - mbd_history_pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+      - ./tools/migrations:/docker-entrypoint-initdb.d/migrations:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mbd -d mbd_history"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mbd-history:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        GIT_BRANCH: ${GIT_BRANCH:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: mbd-history:local
+    container_name: mbd-history
+    restart: unless-stopped
+    depends_on:
+      mbd-history-postgres:
+        condition: service_healthy
+    environment:
+      # Two endpoints, two ports: gRPC requires h2c (Http2-only) on 8080,
+      # /health and the JSON banner are HTTP/1 on 8081.
+      ASPNETCORE_ENVIRONMENT: "Development"
+      History__ConnectionString: "Host=mbd-history-postgres;Port=5432;Database=mbd_history;Username=mbd;Password=mbd"
+      History__GitCommit: ${GIT_COMMIT:-unknown}
+      History__GitBranch: ${GIT_BRANCH:-unknown}
+      History__BuildTime: ${BUILD_TIME:-unknown}
+    ports:
+      # 30005 host -> 8080 container = gRPC. Avoids dev (10005) / paper (20005).
+      - "30005:8080"
+      # 30006 host -> 8081 container = HTTP/1 (health, banner).
+      - "30006:8081"
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -q -O- http://localhost:8081/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  mbd_history_pgdata:
+    name: mbd_history_pgdata

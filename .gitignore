@@ -1,0 +1,39 @@
+# Build artifacts
+bin/
+obj/
+out/
+publish/
+TestResults/
+*.dll
+*.pdb
+*.exe
+*.user
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.userprefs
+
+# Logs
+logs/
+*.log
+
+# Environment / secrets
+.env
+.env.local
+.secrets
+appsettings.Development.json
+appsettings.Local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tooling
+*.lock.json
+nuget.config.local
+
+# Generated proto code (regenerated on build)
+**/Generated/
