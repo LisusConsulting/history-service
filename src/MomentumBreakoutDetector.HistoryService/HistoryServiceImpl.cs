@@ -28,13 +28,16 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
 {
     private readonly ILogger<HistoryServiceImpl> _logger;
     private readonly IOptionQuotesProvider _quotes;
+    private readonly IMacroDataProvider? _macroProvider;
 
     public HistoryServiceImpl(
         ILogger<HistoryServiceImpl> logger,
-        IOptionQuotesProvider quotes)
+        IOptionQuotesProvider quotes,
+        IMacroDataProvider? macroProvider = null)
     {
         _logger = logger;
         _quotes = quotes;
+        _macroProvider = macroProvider;
     }
 
     public override Task<GetBarsResponse> GetBars(GetBarsRequest request, ServerCallContext context)
@@ -93,10 +96,73 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         throw new RpcException(new Status(StatusCode.Unimplemented, "TODO: micro-PR #4 — lift PolygonChainFetcher + chain provider."));
     }
 
-    public override Task<GetMacroResponse> GetMacro(GetMacroRequest request, ServerCallContext context)
+    public override async Task<GetMacroResponse> GetMacro(GetMacroRequest request, ServerCallContext context)
     {
-        _logger.LogInformation("GetMacro called (stub) series={Series}", request.SeriesId);
-        throw new RpcException(new Status(StatusCode.Unimplemented, "TODO: micro-PR #3 — lift FredFetcher + macro provider."));
+        _logger.LogInformation(
+            "GetMacro called series={Series} from={From} to={To}",
+            request.SeriesId, request.FromDate, request.ToDate);
+
+        if (_macroProvider is null)
+        {
+            throw new RpcException(new Status(
+                StatusCode.FailedPrecondition,
+                "MacroDataProvider not registered — check History:ConnectionString configuration."));
+        }
+
+        if (string.IsNullOrWhiteSpace(request.SeriesId))
+        {
+            throw new RpcException(new Status(
+                StatusCode.InvalidArgument, "series_id is required."));
+        }
+        if (request.FromDate is null || request.ToDate is null)
+        {
+            throw new RpcException(new Status(
+                StatusCode.InvalidArgument, "from_date and to_date are required."));
+        }
+
+        var fromDate = DateOnly.FromDateTime(request.FromDate.ToDateTime().ToUniversalTime().Date);
+        var toDate = DateOnly.FromDateTime(request.ToDate.ToDateTime().ToUniversalTime().Date);
+
+        if (fromDate > toDate)
+        {
+            throw new RpcException(new Status(
+                StatusCode.InvalidArgument, "from_date must be <= to_date."));
+        }
+
+        // Quick cache-hit probe: if the cache already covers the requested
+        // window, EnsureRangeCached short-circuits with no FRED calls and
+        // we report cache_hit=true. Otherwise we run the warmup, then read.
+        var cachedBefore = await _macroProvider.GetSeriesAsync(
+            request.SeriesId, fromDate, toDate, context.CancellationToken);
+
+        await _macroProvider.EnsureRangeCachedAsync(
+            request.SeriesId, fromDate, toDate, context.CancellationToken);
+
+        var rows = await _macroProvider.GetSeriesAsync(
+            request.SeriesId, fromDate, toDate, context.CancellationToken);
+
+        var resp = new GetMacroResponse
+        {
+            CacheHit = rows.Count == cachedBefore.Count
+                       && cachedBefore.Count > 0,
+        };
+
+        foreach (var row in rows)
+        {
+            // Skip null-value rows (FRED "." sentinel) — they live as
+            // miss-markers, not in the response payload. Consumers expect
+            // observations to carry a real value.
+            if (row.Value is null) continue;
+            resp.Observations.Add(new MacroObservation
+            {
+                SeriesId = row.SeriesId,
+                ObservationDate = Timestamp.FromDateTime(
+                    DateTime.SpecifyKind(row.ObservationDate.ToDateTime(TimeOnly.MinValue), DateTimeKind.Utc)),
+                Value = (double)row.Value.Value,
+            });
+        }
+
+        return resp;
     }
 
     public override Task EnsureRangeCached(
