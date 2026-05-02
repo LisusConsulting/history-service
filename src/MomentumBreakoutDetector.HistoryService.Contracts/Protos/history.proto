@@ -213,6 +213,12 @@ message EnsureRangeCachedProgress {
   int32 keys_missing = 4;                             // keys still pending fetch
   int32 upstream_calls = 5;                           // batched upstream calls issued so far
   string message = 6;                                 // human-readable status, optional
+  // Which data class this progress event belongs to. Each requested class
+  // emits at least one terminal event with status=COMPLETED|FAILED. The
+  // server may emit interim FETCHING events on long-running classes
+  // (e.g. CHAINS sweeping many trading days).
+  DataClass data_class = 7;
+  int64 elapsed_ms = 8;                               // ms since the warmup orchestrator started
 }
 
 // ----------------------------------------------------------------------------

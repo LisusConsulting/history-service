@@ -34,7 +34,38 @@ public interface IHistoricalBarsProvider
     Task<BarsReadResult> GetBarsAsync(
         string inSymbol, DateTime inFromUtc, DateTime inToUtc,
         BarTimeframe inTimeframe, CancellationToken inCt = default);
+
+    /// <summary>
+    /// Warmup entry-point used by <c>EnsureRangeCached</c>. Identifies
+    /// gaps for (symbol, timeframe) over [<paramref name="inFromUtc"/>,
+    /// <paramref name="inToUtc"/>] and fans out batched Polygon calls.
+    /// Returns the count of upstream Polygon calls actually issued.
+    /// </summary>
+    /// <param name="inProgress">Optional async progress sink — awaited
+    /// once per chunk. Pass <see langword="null"/> for fire-and-forget.
+    /// We use a <c>Func</c> rather than <c>IProgress&lt;T&gt;</c> so the
+    /// chunk loop can flush a gRPC stream write before issuing the next
+    /// upstream call (vs <c>IProgress</c>, which posts to the captured
+    /// <c>SynchronizationContext</c> and arrives after the loop ends in
+    /// the gRPC server thread pool).</param>
+    Task<int> EnsureRangeCachedAsync(
+        string inSymbol, DateTime inFromUtc, DateTime inToUtc,
+        BarTimeframe inTimeframe,
+        Func<BarsWarmupProgress, CancellationToken, Task>? inProgress = null,
+        CancellationToken inCt = default);
 }
+
+/// <summary>
+/// Per-chunk progress emitted by <see cref="IHistoricalBarsProvider.EnsureRangeCachedAsync"/>.
+/// One event per fetched chunk; <see cref="ChunkIndex"/> runs 1..<see cref="ChunksTotal"/>.
+/// </summary>
+public sealed record BarsWarmupProgress(
+    string Symbol,
+    BarTimeframe Timeframe,
+    int ChunkIndex,
+    int ChunksTotal,
+    int BarsFetched,
+    bool IsMissChunk);
 
 /// <summary>
 /// Bars + a cache_hit signal. Materialised as a record so the gRPC
@@ -82,7 +113,9 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
         string inSymbol, DateTime inFromUtc, DateTime inToUtc,
         BarTimeframe inTimeframe, CancellationToken inCt = default)
     {
-        var tmpUpstream = await EnsureRangeCachedAsync(inSymbol, inFromUtc, inToUtc, inTimeframe, inCt);
+        var tmpUpstream = await EnsureRangeCachedAsync(
+            inSymbol, inFromUtc, inToUtc, inTimeframe,
+            inProgress: null, inCt: inCt);
         var tmpBars = await ReadCachedBarsAsync(inSymbol, inFromUtc, inToUtc, inTimeframe, inCt);
         return new BarsReadResult(tmpBars, CacheHit: tmpUpstream == 0);
     }
@@ -193,9 +226,11 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
     /// can populate the cache_hit flag without a second probe.
     /// </summary>
     /// <returns>Number of upstream Polygon calls issued (0 = cache hit).</returns>
-    internal async Task<int> EnsureRangeCachedAsync(
+    public async Task<int> EnsureRangeCachedAsync(
         string inSymbol, DateTime inFromUtc, DateTime inToUtc,
-        BarTimeframe inTimeframe, CancellationToken inCt)
+        BarTimeframe inTimeframe,
+        Func<BarsWarmupProgress, CancellationToken, Task>? inProgress = null,
+        CancellationToken inCt = default)
     {
         if (inFromUtc > inToUtc) return 0;
 
@@ -259,28 +294,49 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
             return 0;
         }
 
-        // Chunk + fetch + upsert + marker.
-        int tmpUpstreamCalls = 0;
+        // Materialize chunks up front so we know the total count for
+        // progress reporting. Each chunk maps 1:1 to a Polygon call.
+        var tmpChunks = new List<(DateTime From, DateTime To)>();
         foreach (var tmpRange in tmpToFetch)
         {
-            foreach (var (tmpChunkFrom, tmpChunkTo) in ChunkRange(tmpRange.From, tmpRange.To, MaxFetchChunkDays))
+            foreach (var tmpChunk in ChunkRange(tmpRange.From, tmpRange.To, MaxFetchChunkDays))
             {
-                tmpUpstreamCalls++;
-                var tmpFetched = await m_BarFetcher.FetchBarsAsync(
-                    inSymbol, tmpChunkFrom, tmpChunkTo, inTimeframe, inCt);
+                tmpChunks.Add(tmpChunk);
+            }
+        }
 
-                if (tmpFetched.Count == 0)
+        // Chunk + fetch + upsert + marker.
+        int tmpUpstreamCalls = 0;
+        for (var tmpIdx = 0; tmpIdx < tmpChunks.Count; tmpIdx++)
+        {
+            var (tmpChunkFrom, tmpChunkTo) = tmpChunks[tmpIdx];
+            tmpUpstreamCalls++;
+            var tmpFetched = await m_BarFetcher.FetchBarsAsync(
+                inSymbol, tmpChunkFrom, tmpChunkTo, inTimeframe, inCt);
+
+            if (tmpFetched.Count == 0)
+            {
+                // Empty → write a miss marker so subsequent runs skip
+                // the re-fetch (4xx, plan-tier limit, weekend/holiday,
+                // contract not yet listed).
+                await RecordBarMissAsync(
+                    tmpConn, inSymbol, tmpTimeframeStr, tmpChunkFrom, tmpChunkTo,
+                    "no-data-from-polygon", inCt);
+                if (inProgress is not null)
                 {
-                    // Empty → write a miss marker so subsequent runs skip
-                    // the re-fetch (4xx, plan-tier limit, weekend/holiday,
-                    // contract not yet listed).
-                    await RecordBarMissAsync(
-                        tmpConn, inSymbol, tmpTimeframeStr, tmpChunkFrom, tmpChunkTo,
-                        "no-data-from-polygon", inCt);
-                    continue;
+                    await inProgress(new BarsWarmupProgress(
+                        inSymbol, inTimeframe, tmpIdx + 1, tmpChunks.Count,
+                        BarsFetched: 0, IsMissChunk: true), inCt);
                 }
+                continue;
+            }
 
-                await UpsertBarsAsync(tmpConn, inSymbol, tmpTimeframeStr, tmpFetched, inCt);
+            await UpsertBarsAsync(tmpConn, inSymbol, tmpTimeframeStr, tmpFetched, inCt);
+            if (inProgress is not null)
+            {
+                await inProgress(new BarsWarmupProgress(
+                    inSymbol, inTimeframe, tmpIdx + 1, tmpChunks.Count,
+                    BarsFetched: tmpFetched.Count, IsMissChunk: false), inCt);
             }
         }
         return tmpUpstreamCalls;

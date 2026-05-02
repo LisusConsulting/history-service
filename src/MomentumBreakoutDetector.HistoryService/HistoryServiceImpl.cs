@@ -331,13 +331,312 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         return resp;
     }
 
-    public override Task EnsureRangeCached(
+    public override async Task EnsureRangeCached(
         EnsureRangeCachedRequest request,
         IServerStreamWriter<EnsureRangeCachedProgress> responseStream,
         ServerCallContext context)
     {
-        _logger.LogInformation("EnsureRangeCached called (stub) symbols={Count}", request.Symbols.Count);
-        throw new RpcException(new Status(StatusCode.Unimplemented, "TODO: micro-PR #7 — warmup orchestrator (depends on PRs #2-#6)."));
+        // ── Validate ────────────────────────────────────────────────────
+        if (request.Symbols.Count == 0)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "at least one symbol is required"));
+        }
+        if (request.DataClasses.Count == 0)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "at least one data_class is required"));
+        }
+        if (request.FromTs is null || request.ToTs is null)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "from_ts and to_ts are required"));
+        }
+        var fromUtc = request.FromTs.ToDateTime();
+        var toUtc = request.ToTs.ToDateTime();
+        if (fromUtc > toUtc)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "from_ts must be <= to_ts"));
+        }
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        _logger.LogInformation(
+            "EnsureRangeCached symbols=[{Symbols}] classes=[{Classes}] from={From:O} to={To:O}",
+            string.Join(",", request.Symbols),
+            string.Join(",", request.DataClasses),
+            fromUtc, toUtc);
+
+        // Stream lock: gRPC server-streaming write is not concurrency-safe.
+        // We fan out kind handlers in parallel so total wall time is the
+        // slowest kind, not the sum — but writes funnel through this lock.
+        var writeLock = new SemaphoreSlim(1, 1);
+
+        async Task EmitAsync(EnsureRangeCachedProgress inProgress)
+        {
+            inProgress.ElapsedMs = stopwatch.ElapsedMilliseconds;
+            await writeLock.WaitAsync(context.CancellationToken).ConfigureAwait(false);
+            try
+            {
+                await responseStream.WriteAsync(inProgress).ConfigureAwait(false);
+            }
+            finally { writeLock.Release(); }
+        }
+
+        // ── Per-class tasks ─────────────────────────────────────────────
+        var tasks = new List<Task>();
+        foreach (var dataClass in request.DataClasses.Distinct())
+        {
+            switch (dataClass)
+            {
+                case DataClass.Bars:
+                    tasks.Add(WarmBarsAsync(request, fromUtc, toUtc, EmitAsync, context.CancellationToken));
+                    break;
+                case DataClass.Chains:
+                    tasks.Add(WarmChainsAsync(request, fromUtc, toUtc, EmitAsync, context.CancellationToken));
+                    break;
+                case DataClass.Macro:
+                    tasks.Add(WarmMacroAsync(request, fromUtc, toUtc, EmitAsync, context.CancellationToken));
+                    break;
+                case DataClass.Nbbo:
+                    // NBBO is point-fetch by nature (one quote per
+                    // (ticker, ts) sub-second); warmup over a [from, to]
+                    // window doesn't have a sensible enumeration. Emit a
+                    // terminal FAILED event with an explanatory message
+                    // instead of throwing — other kinds keep running.
+                    tasks.Add(EmitAsync(new EnsureRangeCachedProgress
+                    {
+                        Status = WarmupStatus.Failed,
+                        DataClass = DataClass.Nbbo,
+                        Message = "NBBO warmup is not implemented (deferred to micro-PR #8). NBBO quotes warm naturally via point fetch.",
+                    }));
+                    break;
+                default:
+                    tasks.Add(EmitAsync(new EnsureRangeCachedProgress
+                    {
+                        Status = WarmupStatus.Failed,
+                        DataClass = dataClass,
+                        Message = $"Unsupported data_class: {dataClass}",
+                    }));
+                    break;
+            }
+        }
+
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+        _logger.LogInformation(
+            "EnsureRangeCached completed in {Elapsed}ms",
+            stopwatch.ElapsedMilliseconds);
+    }
+
+    private async Task WarmBarsAsync(
+        EnsureRangeCachedRequest inRequest, DateTime inFromUtc, DateTime inToUtc,
+        Func<EnsureRangeCachedProgress, Task> inEmit, CancellationToken inCt)
+    {
+        try
+        {
+            var timeframe = inRequest.BarTimeframe == BarTimeframe.Unspecified
+                ? DomainBarTimeframe.OneMinute
+                : MapTimeframe(inRequest.BarTimeframe);
+
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Planning,
+                DataClass = DataClass.Bars,
+                Message = $"Planning bars warmup for {inRequest.Symbols.Count} symbol(s), timeframe={timeframe}",
+            }).ConfigureAwait(false);
+
+            int totalUpstream = 0;
+            var symbols = inRequest.Symbols.ToList();
+            foreach (var symbol in symbols)
+            {
+                Func<BarsWarmupProgress, CancellationToken, Task> progress =
+                    async (p, ct) => await inEmit(new EnsureRangeCachedProgress
+                    {
+                        Status = WarmupStatus.Fetching,
+                        DataClass = DataClass.Bars,
+                        KeysComplete = p.ChunkIndex,
+                        KeysTotal = p.ChunksTotal,
+                        UpstreamCalls = p.ChunkIndex,
+                        Message = $"{p.Symbol} {p.Timeframe} chunk {p.ChunkIndex}/{p.ChunksTotal} → {p.BarsFetched} bars{(p.IsMissChunk ? " (miss-marker)" : "")}",
+                    }).ConfigureAwait(false);
+
+                var tmpUpstream = await _barsProvider.EnsureRangeCachedAsync(
+                    symbol, inFromUtc, inToUtc, timeframe, progress, inCt).ConfigureAwait(false);
+                totalUpstream += tmpUpstream;
+            }
+
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Completed,
+                DataClass = DataClass.Bars,
+                UpstreamCalls = totalUpstream,
+                KeysComplete = totalUpstream,
+                KeysTotal = totalUpstream,
+                Message = $"Bars warmup complete: {symbols.Count} symbol(s), {totalUpstream} upstream call(s)",
+            }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Bars warmup failed");
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Failed,
+                DataClass = DataClass.Bars,
+                Message = $"Bars warmup failed: {ex.Message}",
+            }).ConfigureAwait(false);
+        }
+    }
+
+    private async Task WarmChainsAsync(
+        EnsureRangeCachedRequest inRequest, DateTime inFromUtc, DateTime inToUtc,
+        Func<EnsureRangeCachedProgress, Task> inEmit, CancellationToken inCt)
+    {
+        try
+        {
+            if (_optionChainProvider is null)
+            {
+                await inEmit(new EnsureRangeCachedProgress
+                {
+                    Status = WarmupStatus.Failed,
+                    DataClass = DataClass.Chains,
+                    Message = "Option-chain provider not registered.",
+                }).ConfigureAwait(false);
+                return;
+            }
+
+            // Enumerate calendar days [from, to]. Weekends are filtered —
+            // OptionChainProvider's miss-marker logic still handles
+            // holidays cleanly, but skipping Sat/Sun avoids guaranteed
+            // miss-marker writes. Day enumeration is in UTC.
+            var fromDate = DateOnly.FromDateTime(inFromUtc);
+            var toDate = DateOnly.FromDateTime(inToUtc);
+            var days = new List<DateOnly>();
+            for (var d = fromDate; d <= toDate; d = d.AddDays(1))
+            {
+                if (d.DayOfWeek == DayOfWeek.Saturday || d.DayOfWeek == DayOfWeek.Sunday) continue;
+                days.Add(d);
+            }
+
+            var totalKeys = inRequest.Symbols.Count * days.Count;
+
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Planning,
+                DataClass = DataClass.Chains,
+                KeysTotal = totalKeys,
+                Message = $"Planning chains warmup: {inRequest.Symbols.Count} symbol(s) × {days.Count} weekday(s) = {totalKeys} key(s)",
+            }).ConfigureAwait(false);
+
+            var completed = 0;
+            foreach (var symbol in inRequest.Symbols)
+            {
+                foreach (var day in days)
+                {
+                    await _optionChainProvider.EnsureChainCachedAsync(symbol, day, inCt).ConfigureAwait(false);
+                    completed++;
+                    if (completed % 5 == 0 || completed == totalKeys)
+                    {
+                        await inEmit(new EnsureRangeCachedProgress
+                        {
+                            Status = WarmupStatus.Fetching,
+                            DataClass = DataClass.Chains,
+                            KeysComplete = completed,
+                            KeysTotal = totalKeys,
+                            Message = $"Chains: {symbol} {day} ({completed}/{totalKeys})",
+                        }).ConfigureAwait(false);
+                    }
+                }
+            }
+
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Completed,
+                DataClass = DataClass.Chains,
+                KeysComplete = totalKeys,
+                KeysTotal = totalKeys,
+                Message = $"Chains warmup complete: {totalKeys} (symbol, as-of-date) key(s)",
+            }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Chains warmup failed");
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Failed,
+                DataClass = DataClass.Chains,
+                Message = $"Chains warmup failed: {ex.Message}",
+            }).ConfigureAwait(false);
+        }
+    }
+
+    private async Task WarmMacroAsync(
+        EnsureRangeCachedRequest inRequest, DateTime inFromUtc, DateTime inToUtc,
+        Func<EnsureRangeCachedProgress, Task> inEmit, CancellationToken inCt)
+    {
+        try
+        {
+            if (_macroProvider is null)
+            {
+                await inEmit(new EnsureRangeCachedProgress
+                {
+                    Status = WarmupStatus.Failed,
+                    DataClass = DataClass.Macro,
+                    Message = "Macro provider not registered.",
+                }).ConfigureAwait(false);
+                return;
+            }
+
+            // For macro, the request's `symbols` field carries FRED
+            // series ids (T10Y2Y, CPIAUCSL, UNRATE, ...). The warmup
+            // entry in MacroDataProvider already iterates per-series.
+            var fromDate = DateOnly.FromDateTime(inFromUtc);
+            var toDate = DateOnly.FromDateTime(inToUtc);
+
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Planning,
+                DataClass = DataClass.Macro,
+                KeysTotal = inRequest.Symbols.Count,
+                Message = $"Planning macro warmup: {inRequest.Symbols.Count} series",
+            }).ConfigureAwait(false);
+
+            var done = 0;
+            foreach (var seriesId in inRequest.Symbols)
+            {
+                await _macroProvider.EnsureRangeCachedAsync(seriesId, fromDate, toDate, inCt).ConfigureAwait(false);
+                done++;
+                await inEmit(new EnsureRangeCachedProgress
+                {
+                    Status = WarmupStatus.Fetching,
+                    DataClass = DataClass.Macro,
+                    KeysComplete = done,
+                    KeysTotal = inRequest.Symbols.Count,
+                    Message = $"Macro: {seriesId} ({done}/{inRequest.Symbols.Count})",
+                }).ConfigureAwait(false);
+            }
+
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Completed,
+                DataClass = DataClass.Macro,
+                KeysComplete = inRequest.Symbols.Count,
+                KeysTotal = inRequest.Symbols.Count,
+                Message = $"Macro warmup complete: {inRequest.Symbols.Count} series",
+            }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Macro warmup failed");
+            await inEmit(new EnsureRangeCachedProgress
+            {
+                Status = WarmupStatus.Failed,
+                DataClass = DataClass.Macro,
+                Message = $"Macro warmup failed: {ex.Message}",
+            }).ConfigureAwait(false);
+        }
     }
 
     public override Task<GetCacheStatsResponse> GetCacheStats(GetCacheStatsRequest request, ServerCallContext context)
