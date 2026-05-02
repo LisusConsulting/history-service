@@ -29,6 +29,9 @@
 
     <PackageReference Include="Microsoft.Extensions.Http" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
+
+    <!-- Alpaca SDK — REST data client for stock bars (Phase 2c). -->
+    <PackageReference Include="Alpaca.Markets" />
     <PackageReference Include="Microsoft.Extensions.Options" />
     <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" />
     <PackageReference Include="Microsoft.Extensions.Configuration" />
