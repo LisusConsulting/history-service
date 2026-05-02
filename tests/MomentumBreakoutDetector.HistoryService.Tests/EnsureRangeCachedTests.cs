@@ -79,23 +79,31 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
                 1000m + i, 250.20m + i));
         }
 
-        var tmpStub = new SlowCountingStub(tmpBars, delayMs: 500);
+        var tmpStub = new SlowCountingStub(tmpBars, delayMs: 0);
+        // Use an explicit gate instead of relying on Task.Delay timing —
+        // slow-CI races otherwise let some callers slip past SingleFlight.
+        // The gate keeps the first fetch in-flight while we queue 50
+        // concurrent waiters; release once they're all resident.
+        tmpStub.HoldOpen();
         var tmpProvider = new HistoricalBarsProvider(
             m_ConnectionString,
             tmpStub,
             NullLogger<HistoricalBarsProvider>.Instance);
 
         // Act —
-        //   1. Kick off warmup for the full range.
-        //   2. After ~50ms (warmup is mid-fetch, holding the SingleFlight
-        //      slot), kick off 50 concurrent point-fetches with the SAME
-        //      (symbol, fromUtc, toUtc, timeframe) key. They coalesce
-        //      onto the warmup's in-flight upstream call.
+        //   1. Kick off warmup for the full range. Fetch enters SingleFlight
+        //      and parks at the gate.
+        //   2. Queue 50 concurrent point-fetches with the SAME (symbol,
+        //      fromUtc, toUtc, timeframe) key. Each gap-detects + queues at
+        //      the same SingleFlight slot.
+        //   3. Release the gate; all 51 callers (warmup + 50) share the
+        //      single resolved fetch.
         var tmpWarmupTask = tmpProvider.EnsureRangeCachedAsync(
             "TSLA", tmpFromTs, tmpToTs, DomainBarTimeframe.OneMinute,
             inProgress: null, inCt: CancellationToken.None);
 
-        await Task.Delay(50).ConfigureAwait(false);
+        // Give the warmup time to enter the fetcher's SingleFlight.
+        await Task.Delay(100).ConfigureAwait(false);
 
         var tmpPointFetchTasks = new Task<BarsReadResult>[50];
         for (var i = 0; i < 50; i++)
@@ -103,6 +111,10 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
             tmpPointFetchTasks[i] = tmpProvider.GetBarsAsync(
                 "TSLA", tmpFromTs, tmpToTs, DomainBarTimeframe.OneMinute);
         }
+
+        // Give all 50 point-fetches a moment to converge on SingleFlight.
+        await Task.Delay(200).ConfigureAwait(false);
+        tmpStub.ReleaseGate();
 
         var tmpUpstreamCalls = await tmpWarmupTask.ConfigureAwait(false);
         var tmpResults = await Task.WhenAll(tmpPointFetchTasks).ConfigureAwait(false);
@@ -207,6 +219,7 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
         private readonly int m_DelayMs;
         private int m_Calls;
         private readonly MomentumBreakoutDetector.HistoryService.Concurrency.SingleFlight<BarFetchKey, IReadOnlyList<DomainBar>> m_Coalescer = new();
+        private TaskCompletionSource? m_Gate;
 
         public int CallCount => Volatile.Read(ref m_Calls);
 
@@ -215,6 +228,17 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
             m_Bars = inBars;
             m_DelayMs = delayMs;
         }
+
+        /// <summary>
+        /// Hold the next fetch open until <see cref="ReleaseGate"/>.
+        /// Eliminates slow-CI races where the fixed delayMs window isn't
+        /// wide enough for all concurrent callers to enter SingleFlight
+        /// before the first fetch resolves.
+        /// </summary>
+        public void HoldOpen()
+            => m_Gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void ReleaseGate() => m_Gate?.TrySetResult();
 
         public Task<IReadOnlyList<DomainBar>> FetchBarsAsync(
             string inSymbol, DateTime inFromUtc, DateTime inToUtc,
@@ -231,6 +255,7 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
             return m_Coalescer.ExecuteAsync(tmpKey, async () =>
             {
                 Interlocked.Increment(ref m_Calls);
+                if (m_Gate is not null) await m_Gate.Task.ConfigureAwait(false);
                 if (m_DelayMs > 0)
                 {
                     await Task.Delay(m_DelayMs, inCt).ConfigureAwait(false);

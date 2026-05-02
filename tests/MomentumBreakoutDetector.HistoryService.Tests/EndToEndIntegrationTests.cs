@@ -187,7 +187,11 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
     public async Task ConcurrentPointFetches_ColdStart_CoalesceTo_OneUpstreamCall()
     {
         var tmpMetrics = new MetricsCollector();
-        var tmpHarness = BuildHarness(tmpMetrics, slowFetch: true);
+        var tmpHarness = BuildHarness(tmpMetrics);
+        // Hold the first fetch open with an explicit gate so the test
+        // doesn't depend on Task.Delay timing relative to the SingleFlight
+        // window — slow-CI races otherwise let some callers slip through.
+        tmpHarness.BarFetcher.HoldOpen();
 
         var tmpFromTs = new DateTime(2026, 4, 16, 13, 30, 0, DateTimeKind.Utc);
         var tmpToTs = tmpFromTs.AddMinutes(4);
@@ -200,12 +204,17 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
             ToTs = Timestamp.FromDateTime(tmpToTs),
         };
 
-        // Fire 50 concurrent GetBars before the first one finishes — the
-        // SingleFlight inside PolygonBarFetcher should fold them all into
-        // one upstream call.
+        // Fire 50 concurrent GetBars; the gate keeps the first fetch in-
+        // flight so all 50 callers reach SingleFlight before any return.
         var tmpTasks = Enumerable.Range(0, 50)
             .Select(_ => tmpHarness.Service.GetBars(tmpReq, NewServerCallContext()))
             .ToArray();
+
+        // Give all 50 tasks a moment to enter the SingleFlight slot, then
+        // release the gate so the coalesced fetch resolves.
+        await Task.Delay(200);
+        tmpHarness.BarFetcher.ReleaseGate();
+
         await Task.WhenAll(tmpTasks);
 
         tmpTasks.All(t => t.Result.Bars.Count == 5).ShouldBeTrue();
@@ -494,12 +503,31 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
             (string, DateTime, DateTime, DomainBarTimeframe), IReadOnlyList<DomainBar>> m_Coalescer = new();
         public int CallCount;
 
+        // Optional gate — when set, the fetch awaits the gate before
+        // returning. Lets the coalesce-proof test ensure every concurrent
+        // caller has arrived in SingleFlight before the first fetch
+        // completes (avoids slow-CI races where the 100ms Task.Delay
+        // window isn't wide enough to fold all 50 callers).
+        private TaskCompletionSource? m_Gate;
+
         public ConfigurableBarFetcher(bool slowFetch, FetchOutcome outcome, MetricsCollector? metrics = null)
         {
             m_SlowFetch = slowFetch;
             m_Outcome = outcome;
             m_Metrics = metrics;
         }
+
+        /// <summary>
+        /// Block the next fetch until <see cref="ReleaseGate"/> is called.
+        /// Use to deterministically hold SingleFlight open while the test
+        /// queues N concurrent waiters.
+        /// </summary>
+        public void HoldOpen()
+        {
+            m_Gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        public void ReleaseGate() => m_Gate?.TrySetResult();
 
         public Task<IReadOnlyList<DomainBar>> FetchBarsAsync(
             string inSymbol, DateTime inFromUtc, DateTime inToUtc,
@@ -516,6 +544,7 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
         {
             var tmpStart = System.Diagnostics.Stopwatch.GetTimestamp();
             Interlocked.Increment(ref CallCount);
+            if (m_Gate is not null) await m_Gate.Task;
             if (m_SlowFetch) await Task.Delay(100, inCt);
 
             switch (m_Outcome)
