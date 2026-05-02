@@ -1,8 +1,10 @@
+using System.Diagnostics;
 using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Concurrency;
 using MomentumBreakoutDetector.HistoryService.Domain;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using Refit;
 using TreyThomasCodes.Polygon.Models.Common;
 using TreyThomasCodes.Polygon.Models.Stocks;
@@ -62,6 +64,7 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
 {
     private readonly IStocksService m_Stocks;
     private readonly ILogger<PolygonBarFetcher> m_Logger;
+    private readonly MetricsCollector? m_Metrics;
     private readonly SingleFlight<BarFetchKey, IReadOnlyList<Bar>> m_Coalescer = new();
 
     /// <summary>
@@ -78,10 +81,16 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
 
     public PolygonBarFetcher(
         IStocksService inStocks,
-        ILogger<PolygonBarFetcher> inLogger)
+        ILogger<PolygonBarFetcher> inLogger,
+        MetricsCollector? inMetrics = null)
     {
         m_Stocks = inStocks;
         m_Logger = inLogger;
+        m_Metrics = inMetrics;
+        // Self-register the coalescer in-flight count with the collector
+        // so GetCacheStats can report live concurrency without an extra
+        // backchannel.
+        m_Metrics?.RegisterInFlightProbe(MetricKind.Bars, () => m_Coalescer.InFlightCount);
     }
 
     /// <summary>
@@ -95,7 +104,7 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
         IStocksService inStocks,
         IOptions<HistoryServiceOptions> _,
         ILogger<PolygonBarFetcher> inLogger)
-        : this(inStocks, inLogger)
+        : this(inStocks, inLogger, inMetrics: null)
     {
     }
 
@@ -150,6 +159,7 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
         };
 
         ApiResponse<PolygonResponse<List<StockBar>>> tmpResp;
+        var tmpStopwatch = Stopwatch.StartNew();
         try
         {
             // Raw variant exposes the underlying HttpResponseMessage so we
@@ -157,6 +167,10 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
             // PolygonApiException. Concurrency + per-call timeout are
             // applied by the pipeline handlers.
             tmpResp = await m_Stocks.GetBarsRawAsync(tmpRequest, inCt).ConfigureAwait(false);
+            // Record fetch + latency at the wire boundary, regardless of
+            // 200/4xx. SingleFlight coalesces above us so this fires
+            // exactly once per actual upstream call.
+            m_Metrics?.RecordUpstreamFetch(MetricKind.Bars, tmpStopwatch.Elapsed.TotalMilliseconds);
         }
         catch (TimeoutException ex)
         {
@@ -261,8 +275,8 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
         }
 
         m_Logger.LogInformation(
-            "Polygon on-demand fetch: {Count} {Timeframe} bars for {Symbol} {From}..{To}",
-            tmpBars.Count, inTimeframe, inSymbol, tmpFromStr, tmpToStr);
+            "Polygon bars fetch: {Symbol} {From:yyyy-MM-ddTHH:mm} → {To:yyyy-MM-ddTHH:mm} {Timeframe} → {Rows} rows in {LatencyMs}ms",
+            inSymbol, inFromUtc, inToUtc, inTimeframe, tmpBars.Count, tmpStopwatch.Elapsed.TotalMilliseconds);
         return tmpBars;
     }
 

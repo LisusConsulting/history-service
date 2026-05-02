@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using MomentumBreakoutDetector.HistoryService.Concurrency;
+using MomentumBreakoutDetector.HistoryService.Observability;
 
 namespace MomentumBreakoutDetector.HistoryService.Fetchers;
 
@@ -62,6 +64,7 @@ public sealed class FredFetcher : IFredFetcher
     private readonly SemaphoreSlim _fetchConcurrencyGate;
     private readonly int _perCallTimeoutMs;
     private readonly string? _apiKey;
+    private readonly MetricsCollector? _metrics;
     private readonly SingleFlight<MacroFetchKey, IReadOnlyList<FredObservationRow>> _coalescer = new();
 
     /// <summary>
@@ -87,7 +90,8 @@ public sealed class FredFetcher : IFredFetcher
         IHttpClientFactory? httpClientFactory = null,
         string? apiKey = null,
         int perCallTimeoutMs = DefaultPerCallTimeoutMs,
-        int maxConcurrentFetches = DefaultMaxConcurrentFetches)
+        int maxConcurrentFetches = DefaultMaxConcurrentFetches,
+        MetricsCollector? metrics = null)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
@@ -95,6 +99,8 @@ public sealed class FredFetcher : IFredFetcher
         _perCallTimeoutMs = perCallTimeoutMs > 0 ? perCallTimeoutMs : DefaultPerCallTimeoutMs;
         var maxCc = maxConcurrentFetches > 0 ? maxConcurrentFetches : DefaultMaxConcurrentFetches;
         _fetchConcurrencyGate = new SemaphoreSlim(maxCc, maxCc);
+        _metrics = metrics;
+        _metrics?.RegisterInFlightProbe(MetricKind.Macro, () => _coalescer.InFlightCount);
     }
 
     /// <summary>
@@ -136,6 +142,7 @@ public sealed class FredFetcher : IFredFetcher
         timeoutCts.CancelAfter(_perCallTimeoutMs);
 
         await _fetchConcurrencyGate.WaitAsync(ct);
+        var stopwatch = Stopwatch.StartNew();
         try
         {
             var client = _httpClientFactory?.CreateClient(HttpClientName)
@@ -157,6 +164,7 @@ public sealed class FredFetcher : IFredFetcher
             // abort an entire backtest on a single typo'd series.
             if (resp.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.BadRequest)
             {
+                _metrics?.RecordUpstreamFetch(MetricKind.Macro, stopwatch.Elapsed.TotalMilliseconds);
                 _logger.LogInformation(
                     "FRED {Status} for {Series} {From}..{To} — treating as miss for this run",
                     (int)resp.StatusCode, seriesId, fromDate, toDate);
@@ -200,7 +208,12 @@ public sealed class FredFetcher : IFredFetcher
             }
 
             var json = await resp.Content.ReadAsStringAsync(timeoutCts.Token);
-            return ParseObservations(seriesId, json);
+            var parsed = ParseObservations(seriesId, json);
+            _metrics?.RecordUpstreamFetch(MetricKind.Macro, stopwatch.Elapsed.TotalMilliseconds);
+            _logger.LogInformation(
+                "FRED macro fetch: {Series} {From:yyyy-MM-dd} → {To:yyyy-MM-dd} → {Rows} rows in {LatencyMs}ms",
+                seriesId, fromDate, toDate, parsed.Count, stopwatch.Elapsed.TotalMilliseconds);
+            return parsed;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested
                                                  && !ct.IsCancellationRequested)

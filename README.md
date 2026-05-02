@@ -6,10 +6,13 @@ FRED, and other upstream providers. Consumers (backtest engine, live engine
 NBBO at order time, AI service) call this service instead of hitting upstreams
 directly so each unique key is fetched exactly once across the fleet.
 
-> **Status: Phase 1, micro-PR #1 — deployable shell only.**
-> The service builds, starts, exposes `/health`, and registers all RPCs.
-> Every gRPC method currently returns `Unimplemented`; the real provider
-> lifts land in PRs #2-#7 (see [Phase 1 status](#phase-1-status) below).
+> **Status: Phase 1 complete — feature-complete history service.**
+> All 5 RPCs (`GetBars`, `GetNbbo`, `GetOptionChain`, `GetMacro`,
+> `EnsureRangeCached`) are wired to real providers + upstream fetchers;
+> SingleFlight coalescing folds concurrent identical requests; cache
+> stats are exposed via `GetCacheStats`. Phase 2 (consumer migration to
+> the gRPC client) starts next. See [Phase 1 status](#phase-1-status)
+> for the per-µPR breakdown.
 
 ---
 
@@ -105,19 +108,62 @@ Phase 1 is split into 8 micro-PRs so each one is independently reviewable
 and revertable. **PR #1 is the deployable shell**; the rest lift one
 upstream/provider pair at a time.
 
-| #  | Title                                                  | Status     |
-|---:|--------------------------------------------------------|------------|
-|  1 | Scaffold (repo, compose, Dockerfile, stub gRPC)        | **Done**   |
-|  2 | Lift bars: PolygonBarFetcher + bars provider + GetBars | Not started |
-|  3 | Lift macro: FredFetcher + macro provider + GetMacro    | Not started |
-|  4 | Lift chains: PolygonChainFetcher + GetOptionChain      | Not started |
-|  5 | Lift NBBO: NBBO fetcher + miss-markers + GetNbbo       | Not started |
-|  6 | SingleFlight coalescer + cache-stats accumulator       | Not started |
-|  7 | EnsureRangeCached warmup orchestrator                  | Not started |
-|  8 | Testcontainers integration suite                       | Not started |
+| #  | Title                                                            | Status     |
+|---:|------------------------------------------------------------------|------------|
+|  1 | Scaffold (repo, compose, Dockerfile, stub gRPC)                  | **Done**   |
+|  2 | Lift bars: PolygonBarFetcher + bars provider + GetBars           | **Done**   |
+|  3 | Lift NBBO: NBBO fetcher + miss-markers + GetNbbo                 | **Done**   |
+|  4 | Lift chains: PolygonChainFetcher + GetOptionChain                | **Done**   |
+|  5 | Lift macro: FredFetcher + macro provider + GetMacro              | **Done**   |
+|  6 | SingleFlight coalescer + wrap 4 fetchers                         | **Done**   |
+|  7 | EnsureRangeCached warmup orchestrator (server-streaming)         | **Done**   |
+|  8 | Observability (MetricsCollector + GetCacheStats) + integration tests | **Done** |
 
-Each subsequent PR opens against `develop` and merges back into it.
-`main` lights up at the end of Phase 1.
+`main` lights up after Phase 1 lands. Phase 2 (consumer migration —
+flag-gated swap from in-process providers to the gRPC client in
+backtest + live engines) starts next.
+
+---
+
+## Observability
+
+The service emits structured logs at INFO on every upstream wire call
+(one log line per Polygon /v2/aggs, /v3/quotes, /v3/reference, or FRED
+/series/observations call). Cache hits are counted but NOT logged
+per-call (too noisy). Sample lines:
+
+```
+Polygon bars fetch: TSLA 2026-04-15T13:30 → 2026-04-15T13:34 OneMinute → 5 rows in 184ms
+Polygon NBBO fetch: O:TSLA260418C00250000 @ 2026-04-15T14:00:00.0000000Z → 1 quote in 92ms
+Polygon chain fetch: TSLA as_of=2026-04-15 → 487 contracts across 1 page(s)
+FRED macro fetch: T10Y2Y 2024-04-29 → 2024-05-03 → 5 rows in 62ms
+```
+
+The `GetCacheStats` RPC returns one `ClassStats` row per
+`DataClass`:
+
+```bash
+grpcurl -plaintext localhost:30005 mbd.history.v1.HistoryService/GetCacheStats
+```
+
+Each row carries:
+- `total_requests` — provider-layer entry count (every gRPC call increments).
+- `cache_hits` — served entirely from cache (zero upstream fetches).
+- `upstream_fetches` — actual wire calls (post-SingleFlight coalesce).
+- `miss_markers` — permanent-unavailable writes (4xx responses cached).
+- `in_flight_count` — current SingleFlight in-flight count, summed.
+- `latency_p50_ms` / `latency_p95_ms` / `latency_p99_ms` — over the
+  most recent 1024 wire calls per kind.
+
+A backtest cold-start should see `upstream_fetches > 0` rising,
+`cache_hits = 0` initially, then `upstream_fetches` plateau and
+`cache_hits` rise on subsequent point fetches. A second run over the
+same window should show `upstream_fetches` unchanged from the first
+run + `cache_hits` rising linearly.
+
+OpenTelemetry / Prometheus exporters are out of scope for Phase 1 but
+the collector is process-wide and easily wrapped — Phase 2 adds the
+exporter wiring once consumers are on the new client.
 
 ---
 

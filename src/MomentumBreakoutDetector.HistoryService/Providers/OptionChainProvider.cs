@@ -2,6 +2,7 @@ using Dapper;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using Npgsql;
 
 namespace MomentumBreakoutDetector.HistoryService.Providers;
@@ -89,14 +90,18 @@ public sealed class OptionChainProvider : IOptionChainProvider
   private readonly Dictionary<(string, DateOnly), Task> m_FetchInflight = new();
   private readonly object m_FetchInflightLock = new();
 
+  private readonly MetricsCollector? m_Metrics;
+
   public OptionChainProvider(
     IOptions<HistoryServiceOptions> inOptions,
     ILogger<OptionChainProvider> inLogger,
-    IPolygonChainFetcher inChainFetcher)
+    IPolygonChainFetcher inChainFetcher,
+    MetricsCollector? inMetrics = null)
   {
     m_ConnectionString = inOptions.Value.ConnectionString;
     m_Logger = inLogger;
     m_ChainFetcher = inChainFetcher;
+    m_Metrics = inMetrics;
   }
 
   public async Task<OptionChainResult> GetChainAsync(
@@ -107,6 +112,7 @@ public sealed class OptionChainProvider : IOptionChainProvider
       return new OptionChainResult(
         Array.Empty<OptionContractRow>(), CacheHit: true, IsMissMarker: false);
     }
+    m_Metrics?.RecordRequest(MetricKind.Chains);
 
     await using var tmpConn = new NpgsqlConnection(m_ConnectionString);
     await tmpConn.OpenAsync(inCt);
@@ -143,6 +149,7 @@ public sealed class OptionChainProvider : IOptionChainProvider
 
       if (tmpMissed)
       {
+        m_Metrics?.RecordCacheHit(MetricKind.Chains);
         return new OptionChainResult(
           Array.Empty<OptionContractRow>(), CacheHit: true, IsMissMarker: true);
       }
@@ -177,6 +184,7 @@ public sealed class OptionChainProvider : IOptionChainProvider
     // empty and a miss-marker was just written. Surface that.
     var tmpIsMiss = !tmpCacheHit && tmpList.Count == 0;
 
+    if (tmpCacheHit) m_Metrics?.RecordCacheHit(MetricKind.Chains);
     return new OptionChainResult(tmpList, CacheHit: tmpCacheHit, IsMissMarker: tmpIsMiss);
   }
 
@@ -335,6 +343,7 @@ public sealed class OptionChainProvider : IOptionChainProvider
       ON CONFLICT (symbol, as_of_date) DO NOTHING
       """,
       new { Symbol = inSymbol, Date = inAsOfDate.ToString("yyyy-MM-dd"), Reason = inReason });
+    m_Metrics?.RecordMissMarker(MetricKind.Chains);
     m_Logger.LogInformation(
       "Recorded chain miss-marker {Symbol} as_of {AsOf} ({Reason})",
       inSymbol, inAsOfDate, inReason);

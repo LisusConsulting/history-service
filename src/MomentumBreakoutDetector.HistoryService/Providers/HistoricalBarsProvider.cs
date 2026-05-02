@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Domain;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using Npgsql;
 
 namespace MomentumBreakoutDetector.HistoryService.Providers;
@@ -81,6 +82,7 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
     private readonly string m_ConnectionString;
     private readonly ILogger<HistoricalBarsProvider> m_Logger;
     private readonly IPolygonBarFetcher m_BarFetcher;
+    private readonly MetricsCollector? m_Metrics;
 
     /// <summary>
     /// Hard ceiling on the per-call Polygon /v2/aggs window in days.
@@ -93,8 +95,9 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
     public HistoricalBarsProvider(
         IOptions<HistoryServiceOptions> inOptions,
         IPolygonBarFetcher inBarFetcher,
-        ILogger<HistoricalBarsProvider> inLogger)
-        : this(inOptions.Value.ConnectionString, inBarFetcher, inLogger)
+        ILogger<HistoricalBarsProvider> inLogger,
+        MetricsCollector? inMetrics = null)
+        : this(inOptions.Value.ConnectionString, inBarFetcher, inLogger, inMetrics)
     {
     }
 
@@ -102,22 +105,31 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
     public HistoricalBarsProvider(
         string inConnectionString,
         IPolygonBarFetcher inBarFetcher,
-        ILogger<HistoricalBarsProvider> inLogger)
+        ILogger<HistoricalBarsProvider> inLogger,
+        MetricsCollector? inMetrics = null)
     {
         m_ConnectionString = inConnectionString;
         m_BarFetcher = inBarFetcher;
         m_Logger = inLogger;
+        m_Metrics = inMetrics;
     }
 
     public async Task<BarsReadResult> GetBarsAsync(
         string inSymbol, DateTime inFromUtc, DateTime inToUtc,
         BarTimeframe inTimeframe, CancellationToken inCt = default)
     {
+        m_Metrics?.RecordRequest(MetricKind.Bars);
         var tmpUpstream = await EnsureRangeCachedAsync(
             inSymbol, inFromUtc, inToUtc, inTimeframe,
             inProgress: null, inCt: inCt);
         var tmpBars = await ReadCachedBarsAsync(inSymbol, inFromUtc, inToUtc, inTimeframe, inCt);
-        return new BarsReadResult(tmpBars, CacheHit: tmpUpstream == 0);
+        var tmpCacheHit = tmpUpstream == 0;
+        // Provider-layer cache-hit accounting: zero upstream calls means
+        // the read was served entirely from postgres. Fetcher records the
+        // upstream side; this records the cache side so GetCacheStats can
+        // compute hit-rate.
+        if (tmpCacheHit) m_Metrics?.RecordCacheHit(MetricKind.Bars);
+        return new BarsReadResult(tmpBars, CacheHit: tmpCacheHit);
     }
 
     /// <summary>
@@ -464,6 +476,7 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
             ON CONFLICT (symbol, timeframe, range_from, range_to) DO NOTHING
             """,
             new { Symbol = inSymbol, Timeframe = inTimeframe, From = inFromUtc, To = inToUtc, Reason = inReason });
+        m_Metrics?.RecordMissMarker(MetricKind.Bars);
         m_Logger.LogInformation(
             "Recorded bar miss-marker {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd} ({Reason})",
             inSymbol, inTimeframe, inFromUtc, inToUtc, inReason);

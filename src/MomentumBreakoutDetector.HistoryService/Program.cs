@@ -10,6 +10,7 @@ using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
 using MomentumBreakoutDetector.HistoryService.MessageHandlers;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using MomentumBreakoutDetector.HistoryService.Providers;
 using Serilog;
 using TreyThomasCodes.Polygon.RestClient.Extensions;
@@ -27,6 +28,15 @@ builder.Host.UseSerilog();
 // --- Configuration --------------------------------------------------------
 builder.Services.Configure<HistoryServiceOptions>(
     builder.Configuration.GetSection(HistoryServiceOptions.SectionName));
+
+// --- Observability (micro-PR #8) ------------------------------------------
+// MetricsCollector is process-wide: counters + per-kind ring buffer for
+// p50/p95/p99 + in-flight probe registry. Fetchers self-register their
+// SingleFlight in-flight count at construction time; providers + fetchers
+// inject the collector via constructor and call RecordCacheHit /
+// RecordUpstreamFetch / RecordMissMarker on the appropriate paths. The
+// gRPC GetCacheStats RPC reads a snapshot at request time.
+builder.Services.AddSingleton<MetricsCollector>();
 
 // --- Polygon SDK (Phase E) ------------------------------------------------
 // Replaces three previously-separate IHttpClientFactory bindings (the
@@ -80,17 +90,20 @@ builder.Services.AddSingleton<IFredFetcher>(sp =>
     var logger = sp.GetRequiredService<ILogger<FredFetcher>>();
     var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
     var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
+    var metrics = sp.GetRequiredService<MetricsCollector>();
     return new FredFetcher(
         logger: logger,
         httpClientFactory: httpClientFactory,
-        apiKey: string.IsNullOrWhiteSpace(opts.FredApiKey) ? null : opts.FredApiKey);
+        apiKey: string.IsNullOrWhiteSpace(opts.FredApiKey) ? null : opts.FredApiKey,
+        metrics: metrics);
 });
 builder.Services.AddScoped<IMacroDataProvider>(sp =>
 {
     var logger = sp.GetRequiredService<ILogger<MacroDataProvider>>();
     var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
     var fred = sp.GetRequiredService<IFredFetcher>();
-    return new MacroDataProvider(opts.ConnectionString, logger, fred);
+    var metrics = sp.GetRequiredService<MetricsCollector>();
+    return new MacroDataProvider(opts.ConnectionString, logger, fred, metrics);
 });
 
 // --- Option chains (micro-PR #4) -----------------------------------------

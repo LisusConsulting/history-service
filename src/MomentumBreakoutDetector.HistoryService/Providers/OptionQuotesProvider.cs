@@ -2,6 +2,7 @@ using Dapper;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using Npgsql;
 
 namespace MomentumBreakoutDetector.HistoryService.Providers;
@@ -38,12 +39,14 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
     private readonly ILogger<OptionQuotesProvider> m_Logger;
     private readonly string m_ConnectionString;
     private readonly int m_StaleQuoteToleranceSeconds;
+    private readonly MetricsCollector? m_Metrics;
 
     public OptionQuotesProvider(
         NbboMemoryCache inMemCache,
         IPolygonNbboFetcher inFetcher,
         IOptions<HistoryServiceOptions> inOpts,
-        ILogger<OptionQuotesProvider> inLogger)
+        ILogger<OptionQuotesProvider> inLogger,
+        MetricsCollector? inMetrics = null)
     {
         m_MemCache = inMemCache;
         m_Fetcher = inFetcher;
@@ -53,6 +56,7 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
         m_StaleQuoteToleranceSeconds = tmpOpts.NbboStaleQuoteToleranceSeconds > 0
             ? tmpOpts.NbboStaleQuoteToleranceSeconds
             : DefaultStaleQuoteToleranceSeconds;
+        m_Metrics = inMetrics;
     }
 
     public async Task<OptionQuotesLookup> GetAtOrBeforeAsync(
@@ -60,15 +64,19 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
         DateTime inTsUtc,
         CancellationToken inCt = default)
     {
+        m_Metrics?.RecordRequest(MetricKind.Nbbo);
+
         // 1) In-memory hit?
         if (m_MemCache.TryGetHit(inTicker, inTsUtc, out var tmpMemHit) && tmpMemHit is not null)
         {
+            m_Metrics?.RecordCacheHit(MetricKind.Nbbo);
             return new OptionQuotesLookup(tmpMemHit, CacheHit: true, IsMissMarker: false);
         }
 
         // 2) In-memory miss-marker?
         if (m_MemCache.IsMiss(inTicker, inTsUtc))
         {
+            m_Metrics?.RecordCacheHit(MetricKind.Nbbo);
             return new OptionQuotesLookup(null, CacheHit: true, IsMissMarker: true);
         }
 
@@ -77,6 +85,7 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
         if (tmpDb is not null)
         {
             m_MemCache.PutHit(tmpDb);
+            m_Metrics?.RecordCacheHit(MetricKind.Nbbo);
             return new OptionQuotesLookup(tmpDb, CacheHit: true, IsMissMarker: false);
         }
 
@@ -84,6 +93,7 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
         if (await IsKnownMissAsync(inTicker, inTsUtc, inCt).ConfigureAwait(false))
         {
             m_MemCache.PutMiss(inTicker, inTsUtc);
+            m_Metrics?.RecordCacheHit(MetricKind.Nbbo);
             return new OptionQuotesLookup(null, CacheHit: true, IsMissMarker: true);
         }
 
@@ -103,6 +113,7 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
                 await RecordMissAsync(inTicker, inTsUtc, tmpFetch.MissReason ?? "miss", inCt)
                     .ConfigureAwait(false);
                 m_MemCache.PutMiss(inTicker, inTsUtc);
+                m_Metrics?.RecordMissMarker(MetricKind.Nbbo);
                 return new OptionQuotesLookup(null, CacheHit: false, IsMissMarker: true);
             }
             case PolygonNbboOutcome.Transient:

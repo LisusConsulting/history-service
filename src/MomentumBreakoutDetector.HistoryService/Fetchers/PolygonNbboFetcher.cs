@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Concurrency;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using TreyThomasCodes.Polygon.RestClient.Exceptions;
 using TreyThomasCodes.Polygon.RestClient.Requests.Options;
 using TreyThomasCodes.Polygon.RestClient.Services;
@@ -47,14 +49,18 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
 
     private readonly IOptionsService m_Options;
     private readonly ILogger<PolygonNbboFetcher> m_Logger;
+    private readonly MetricsCollector? m_Metrics;
     private readonly SingleFlight<NbboFetchKey, PolygonNbboFetch> m_Coalescer = new();
 
     public PolygonNbboFetcher(
         IOptionsService inOptions,
-        ILogger<PolygonNbboFetcher> inLogger)
+        ILogger<PolygonNbboFetcher> inLogger,
+        MetricsCollector? inMetrics = null)
     {
         m_Options = inOptions;
         m_Logger = inLogger;
+        m_Metrics = inMetrics;
+        m_Metrics?.RegisterInFlightProbe(MetricKind.Nbbo, () => m_Coalescer.InFlightCount);
     }
 
     /// <summary>
@@ -67,7 +73,7 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
         IOptionsService inOptions,
         IOptions<HistoryServiceOptions> _,
         ILogger<PolygonNbboFetcher> inLogger)
-        : this(inOptions, inLogger)
+        : this(inOptions, inLogger, inMetrics: null)
     {
     }
 
@@ -105,19 +111,30 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
             Limit = 1,
         };
 
+        var tmpStopwatch = Stopwatch.StartNew();
         try
         {
             var tmpResp = await m_Options
                 .GetQuotesAsync(tmpRequest, inCt)
                 .ConfigureAwait(false);
+            // Wire call landed (success or empty body); record the upstream
+            // and latency. Exception paths below count as fetches too — we
+            // record in their catch blocks.
+            m_Metrics?.RecordUpstreamFetch(MetricKind.Nbbo, tmpStopwatch.Elapsed.TotalMilliseconds);
 
             var tmpQuote = tmpResp?.Results?.FirstOrDefault();
             if (tmpQuote is null
                 || tmpQuote.BidPrice is null || tmpQuote.AskPrice is null
                 || tmpQuote.SipTimestamp is null)
             {
+                m_Logger.LogInformation(
+                    "Polygon NBBO fetch: {Ticker} @ {Ts:O} → 0 quotes (miss) in {LatencyMs}ms",
+                    inTicker, inTsUtc, tmpStopwatch.Elapsed.TotalMilliseconds);
                 return new PolygonNbboFetch(PolygonNbboOutcome.Miss, null, "no quote in window");
             }
+            m_Logger.LogInformation(
+                "Polygon NBBO fetch: {Ticker} @ {Ts:O} → 1 quote in {LatencyMs}ms",
+                inTicker, inTsUtc, tmpStopwatch.Elapsed.TotalMilliseconds);
 
             // SIP timestamp is nanoseconds since epoch.
             var tmpAsOf = DateTimeOffset
@@ -143,6 +160,7 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
             // Plan-tier limit. Polygon returns NOT_AUTHORIZED outside the
             // subscription's history depth (Options Advanced /v3 quotes
             // start 2022-03-07).
+            m_Metrics?.RecordUpstreamFetch(MetricKind.Nbbo, tmpStopwatch.Elapsed.TotalMilliseconds);
             m_Logger.LogInformation(
                 "Quote NOT_AUTHORIZED for {Ticker} @ {Ts:O} — outside plan history depth",
                 inTicker, inTsUtc);
@@ -150,6 +168,7 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
         }
         catch (PolygonApiException ex) when (ex.IsNotFound)
         {
+            m_Metrics?.RecordUpstreamFetch(MetricKind.Nbbo, tmpStopwatch.Elapsed.TotalMilliseconds);
             // 404 — same shape as a Miss. Caller writes a marker.
             return new PolygonNbboFetch(PolygonNbboOutcome.Miss, null, "not-found");
         }
