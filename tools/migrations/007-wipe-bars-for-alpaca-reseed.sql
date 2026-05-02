@@ -1,0 +1,32 @@
+-- 007 — Wipe stock-bar caches for the Alpaca re-seed (May 2026).
+--
+-- Background: Polygon's plan caps 1-min stock-bar history at ~2 years,
+-- which left the original TSLA backfill with 800 NOT_AUTHORIZED days
+-- (2022-08-25 onward) and 39 forward-seed misses. PR #14 swapped the
+-- bars fetcher to Alpaca, which has uncapped history on the paid SIP
+-- feed. The Polygon-fed cache contents need to go so the re-seed pulls
+-- complete data from Alpaca.
+--
+-- Scope is bars-only:
+--   - historical_bars        — stock OHLCV cache. TRUNCATE.
+--   - historical_bars_misses — bar-fetch miss markers. TRUNCATE.
+--
+-- DO NOT touch:
+--   - historical_options_quotes        (Polygon NBBO — Polygon stays for options)
+--   - historical_options_contracts     (Polygon chain snapshots)
+--   - historical_options_quotes_misses (NBBO miss markers)
+--   - historical_options_chains_misses (chain miss markers)
+--   - macro_data + macro_data_misses   (FRED — unrelated)
+--   - cache_stats                      (observability counters — preserve)
+--
+-- This migration is idempotent: re-running TRUNCATE on already-empty
+-- tables is a no-op. The bars hypertable's chunks are dropped under
+-- the hood (TimescaleDB TRUNCATE is chunk-aware).
+--
+-- After running: re-seed via tools/seed/MomentumBreakoutDetector.HistoryService.Seeder
+-- with a fresh checkpoint name (checkpoint.tsla-alpaca.json) to avoid
+-- the prior checkpoint's "completed days" optimisation skipping the
+-- re-fetch.
+
+TRUNCATE TABLE historical_bars;
+TRUNCATE TABLE historical_bars_misses;

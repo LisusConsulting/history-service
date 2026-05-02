@@ -60,8 +60,12 @@ services:
       # Alpaca data API — stock bars (Phase 2c). Uncapped 1-min history
       # on the paid SIP feed. Same fail-quiet contract as Polygon when
       # unset.
-      History__AlpacaApiKey: ${ALPACA_API_KEY:-}
-      History__AlpacaApiSecret: ${ALPACA_API_SECRET:-}
+      #
+      # Env-var names: HWZ_PPR_KID / HWZ_PPR_SK in .env. Distinct from
+      # MBD's ALPACA_API_KEY / ALPACA_API_SECRET — this clone uses a
+      # separate Alpaca account (data API only, account-independent).
+      History__AlpacaApiKey: ${HWZ_PPR_KID:-}
+      History__AlpacaApiSecret: ${HWZ_PPR_SK:-}
       # "sip" (paid, full consolidated tape) or "iex" (free, IEX-only).
       # Default sip — Lisus has the paid Alpaca subscription.
       History__AlpacaDataFeed: ${ALPACA_DATA_FEED:-sip}
