@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Concurrency;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using Refit;
 using TreyThomasCodes.Polygon.Models.Common;
 using TreyThomasCodes.Polygon.Models.Options;
@@ -78,6 +80,7 @@ public sealed class PolygonChainFetcher : IPolygonChainFetcher
 {
     private readonly IOptionsService m_Options;
     private readonly ILogger<PolygonChainFetcher> m_Logger;
+    private readonly MetricsCollector? m_Metrics;
     private readonly SingleFlight<ChainFetchKey, IReadOnlyList<OptionsContract>> m_Coalescer = new();
 
     /// <summary>
@@ -99,10 +102,13 @@ public sealed class PolygonChainFetcher : IPolygonChainFetcher
 
     public PolygonChainFetcher(
         IOptionsService inOptions,
-        ILogger<PolygonChainFetcher> inLogger)
+        ILogger<PolygonChainFetcher> inLogger,
+        MetricsCollector? inMetrics = null)
     {
         m_Options = inOptions;
         m_Logger = inLogger;
+        m_Metrics = inMetrics;
+        m_Metrics?.RegisterInFlightProbe(MetricKind.Chains, () => m_Coalescer.InFlightCount);
     }
 
     /// <summary>
@@ -147,11 +153,16 @@ public sealed class PolygonChainFetcher : IPolygonChainFetcher
                 };
 
                 ApiResponse<PolygonResponse<List<OptionsContract>>> tmpResp;
+                var tmpPageWatch = Stopwatch.StartNew();
                 try
                 {
                     tmpResp = await m_Options
                         .GetListContractsRawAsync(tmpRequest, inCt)
                         .ConfigureAwait(false);
+                    // One pagination page = one wire call. Record the
+                    // upstream + latency per page so percentiles reflect
+                    // real Polygon round-trips, not full-sweep totals.
+                    m_Metrics?.RecordUpstreamFetch(MetricKind.Chains, tmpPageWatch.Elapsed.TotalMilliseconds);
                 }
                 catch (TimeoutException)
                 {
@@ -202,8 +213,8 @@ public sealed class PolygonChainFetcher : IPolygonChainFetcher
                      && !inCt.IsCancellationRequested);
 
             m_Logger.LogInformation(
-                "Polygon on-demand chain fetch: {Count} contracts for {Symbol} as_of {AsOf} ({Pages} pages)",
-                tmpAll.Count, inSymbol, tmpAsOfStr, tmpPage);
+                "Polygon chain fetch: {Symbol} as_of={AsOf} → {Rows} contracts across {Pages} page(s)",
+                inSymbol, tmpAsOfStr, tmpAll.Count, tmpPage);
             return tmpAll;
         }
         catch (HttpRequestException ex)

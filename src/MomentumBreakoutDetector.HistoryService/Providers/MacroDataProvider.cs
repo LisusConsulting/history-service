@@ -1,5 +1,6 @@
 using Dapper;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using Npgsql;
 
 namespace MomentumBreakoutDetector.HistoryService.Providers;
@@ -57,6 +58,7 @@ public sealed class MacroDataProvider : IMacroDataProvider
     private readonly string _connectionString;
     private readonly ILogger<MacroDataProvider> _logger;
     private readonly IFredFetcher? _fredFetcher;
+    private readonly MetricsCollector? _metrics;
 
     /// <summary>
     /// FRED series the runtime depends on, with their published cadence.
@@ -77,11 +79,13 @@ public sealed class MacroDataProvider : IMacroDataProvider
     public MacroDataProvider(
         string connectionString,
         ILogger<MacroDataProvider> logger,
-        IFredFetcher? fredFetcher = null)
+        IFredFetcher? fredFetcher = null,
+        MetricsCollector? metrics = null)
     {
         _connectionString = connectionString;
         _logger = logger;
         _fredFetcher = fredFetcher;
+        _metrics = metrics;
     }
 
     /// <summary>
@@ -95,6 +99,7 @@ public sealed class MacroDataProvider : IMacroDataProvider
         string seriesId, DateOnly fromDate, DateOnly toDate,
         CancellationToken ct)
     {
+        _metrics?.RecordRequest(MetricKind.Macro);
         if (_fredFetcher is null) return;
         if (fromDate > toDate) return;
 
@@ -136,6 +141,7 @@ public sealed class MacroDataProvider : IMacroDataProvider
 
         if (cachedCount + markerCount >= expected)
         {
+            _metrics?.RecordCacheHit(MetricKind.Macro);
             _logger.LogDebug(
                 "Macro cache fully covers {Series} {From}..{To} ({Cached} rows + {Markers} markers >= {Expected} expected) — no FRED fetch",
                 seriesId, fromDate, toDate, cachedCount, markerCount, expected);
@@ -156,6 +162,7 @@ public sealed class MacroDataProvider : IMacroDataProvider
             // idempotent (PK).
             await RecordRangeMissAsync(conn, seriesId, fromDate, toDate, cadence,
                 "no-data-from-fred", ct);
+            _metrics?.RecordMissMarker(MetricKind.Macro);
             return;
         }
 
@@ -189,6 +196,13 @@ public sealed class MacroDataProvider : IMacroDataProvider
         // every subsequent one.
         var unreturnedMarkers = await BackfillMissingBoundaryMarkersAsync(
             conn, seriesId, fromDate, toDate, cadence, returnedDates, ct);
+
+        if (markers + unreturnedMarkers > 0)
+        {
+            // One miss-marker counter increment per warmup that produced
+            // any markers — keeps the counter granular but cheap.
+            _metrics?.RecordMissMarker(MetricKind.Macro);
+        }
 
         _logger.LogInformation(
             "Macro on-demand fill: {Series} {From}..{To} → {Upserts} values upserted, {Markers} missing-value markers, {Boundary} boundary markers",

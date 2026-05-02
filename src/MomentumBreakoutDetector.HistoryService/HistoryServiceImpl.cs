@@ -2,6 +2,7 @@ using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
 using MomentumBreakoutDetector.HistoryService.Contracts.V1;
+using MomentumBreakoutDetector.HistoryService.Observability;
 using MomentumBreakoutDetector.HistoryService.Providers;
 using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTimeframe;
 using V1Bar = MomentumBreakoutDetector.HistoryService.Contracts.V1.Bar;
@@ -39,19 +40,24 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
     // provider. Nullable so that earlier-not-yet-merged PRs don't break
     // the DI graph; an absent provider falls through to Unimplemented.
     private readonly IOptionChainProvider? _optionChainProvider;
+    // Phase 1 micro-PR #8 — observability surface. Nullable for tests
+    // that bypass DI; in production the singleton is always registered.
+    private readonly MetricsCollector? _metrics;
 
     public HistoryServiceImpl(
         ILogger<HistoryServiceImpl> logger,
         IHistoricalBarsProvider barsProvider,
         IOptionQuotesProvider quotes,
         IMacroDataProvider? macroProvider = null,
-        IOptionChainProvider? optionChainProvider = null)
+        IOptionChainProvider? optionChainProvider = null,
+        MetricsCollector? metrics = null)
     {
         _logger = logger;
         _barsProvider = barsProvider;
         _quotes = quotes;
         _macroProvider = macroProvider;
         _optionChainProvider = optionChainProvider;
+        _metrics = metrics;
     }
 
     public override async Task<GetBarsResponse> GetBars(GetBarsRequest request, ServerCallContext context)
@@ -641,7 +647,62 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
 
     public override Task<GetCacheStatsResponse> GetCacheStats(GetCacheStatsRequest request, ServerCallContext context)
     {
-        _logger.LogInformation("GetCacheStats called (stub) class={Class}", request.DataClass);
-        throw new RpcException(new Status(StatusCode.Unimplemented, "TODO: micro-PR #6 — SingleFlight coalescer + stats accumulator."));
+        _logger.LogInformation("GetCacheStats called class={Class}", request.DataClass);
+
+        if (_metrics is null)
+        {
+            // No collector wired (tests that omit DI). Return empty
+            // response rather than 5xx so probe endpoints stay healthy.
+            return Task.FromResult(new GetCacheStatsResponse
+            {
+                AsOf = Timestamp.FromDateTime(DateTime.UtcNow),
+            });
+        }
+
+        var snapshot = _metrics.Snapshot();
+        var resp = new GetCacheStatsResponse
+        {
+            AsOf = Timestamp.FromDateTime(DateTime.SpecifyKind(snapshot.AsOfUtc, DateTimeKind.Utc)),
+        };
+
+        // Map the internal MetricKind → proto DataClass enum. We emit
+        // one ClassStats row per kind regardless of the request filter
+        // for simple consumers; a `data_class` filter on the request
+        // narrows to a single row.
+        foreach (var c in snapshot.Classes)
+        {
+            var protoClass = MapKind(c.Kind);
+            if (request.DataClass != DataClass.Unspecified && request.DataClass != protoClass)
+            {
+                continue;
+            }
+            resp.ClassStats.Add(new ClassStats
+            {
+                DataClass = protoClass,
+                TotalRequests = c.TotalRequests,
+                CacheHits = c.CacheHits,
+                UpstreamFetches = c.UpstreamFetches,
+                MissMarkers = c.MissMarkers,
+                InFlightCount = c.InFlightCount,
+                LatencyP50Ms = c.LatencyP50Ms,
+                LatencyP95Ms = c.LatencyP95Ms,
+                LatencyP99Ms = c.LatencyP99Ms,
+            });
+        }
+        return Task.FromResult(resp);
     }
+
+    /// <summary>
+    /// Bridge between the internal counter taxonomy
+    /// (<see cref="MetricKind"/>) and the proto-emitted enum
+    /// (<see cref="DataClass"/>).
+    /// </summary>
+    private static DataClass MapKind(MetricKind inKind) => inKind switch
+    {
+        MetricKind.Bars => DataClass.Bars,
+        MetricKind.Nbbo => DataClass.Nbbo,
+        MetricKind.Chains => DataClass.Chains,
+        MetricKind.Macro => DataClass.Macro,
+        _ => DataClass.Unspecified,
+    };
 }
