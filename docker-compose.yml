@@ -50,6 +50,13 @@ services:
       # on 401/403 so an unset key surfaces as zero-bar responses + warn
       # logs rather than a hard crash.
       History__PolygonApiKey: ${POLYGON_API_KEY:-}
+      # FRED API key for the macro fetcher (FRED series observations).
+      # Same fail-quiet contract as Polygon when unset.
+      History__FredApiKey: ${FRED_API_KEY:-}
+      # M2M client_credentials secret for the future Phase 2 auth surface
+      # (sts.motuzko.com, scope: mbd-history). Pre-wired so operators
+      # can set it once in .env without a follow-up compose edit.
+      MBD_API_TOOLS_SECRET: ${MBD_API_TOOLS_SECRET:-}
       History__GitCommit: ${GIT_COMMIT:-unknown}
       History__GitBranch: ${GIT_BRANCH:-unknown}
       History__BuildTime: ${BUILD_TIME:-unknown}
