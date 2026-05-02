@@ -705,12 +705,14 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
               fetched_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
               PRIMARY KEY (ticker, ts)
             );
+            -- Range-shape post PR #3 (was point-shape (ticker, ts) pre-2026-05-02).
             CREATE TABLE IF NOT EXISTS historical_options_quotes_misses (
               ticker      VARCHAR(50)  NOT NULL,
-              ts          TIMESTAMPTZ  NOT NULL,
+              range_from  TIMESTAMPTZ  NOT NULL,
+              range_to    TIMESTAMPTZ  NOT NULL,
               reason      TEXT,
-              recorded_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-              PRIMARY KEY (ticker, ts)
+              fetched_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (ticker, range_from, range_to)
             );
 
             -- Chains

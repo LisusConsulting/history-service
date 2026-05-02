@@ -20,14 +20,22 @@ CREATE TABLE IF NOT EXISTS historical_bars_misses (
 CREATE INDEX IF NOT EXISTS idx_historical_bars_misses_lookup
   ON historical_bars_misses (symbol, timeframe, range_from, range_to);
 
--- NBBO: point-keyed misses (ticker, ts).
+-- NBBO: range-keyed misses (ticker, [range_from, range_to]).
+-- Originally point-keyed (ticker, ts); migrated to range-shape in 009
+-- so the intra-range gap-detection path can store one row per
+-- contiguous missing minute-run (brief 2026-05-02). Fresh-volume inits
+-- create the new shape directly so 009 is a no-op on fresh DBs and only
+-- does real work on existing dev/paper volumes.
 CREATE TABLE IF NOT EXISTS historical_options_quotes_misses (
-  ticker     VARCHAR(50)  NOT NULL,
-  ts         TIMESTAMPTZ  NOT NULL,
-  reason     TEXT,
-  recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (ticker, ts)
+  ticker      VARCHAR(50)  NOT NULL,
+  range_from  TIMESTAMPTZ  NOT NULL,
+  range_to    TIMESTAMPTZ  NOT NULL,
+  reason      TEXT,
+  fetched_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (ticker, range_from, range_to)
 );
+CREATE INDEX IF NOT EXISTS idx_historical_options_quotes_misses_lookup
+  ON historical_options_quotes_misses (ticker, range_from, range_to);
 
 -- Chains: date-keyed misses (symbol, as_of_date).
 CREATE TABLE IF NOT EXISTS historical_options_chains_misses (
