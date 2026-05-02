@@ -1,6 +1,7 @@
 using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using MomentumBreakoutDetector.HistoryService.Concurrency;
 using MomentumBreakoutDetector.HistoryService.Domain;
 using Refit;
 using TreyThomasCodes.Polygon.Models.Common;
@@ -46,10 +47,22 @@ public interface IPolygonBarFetcher
         BarTimeframe inTimeframe, CancellationToken inCt);
 }
 
+/// <summary>
+/// Coalescer key for <see cref="PolygonBarFetcher"/>. Two concurrent
+/// requests with the same (symbol, fromUtc, toUtc, timeframe) are folded
+/// into a single upstream Polygon call.
+/// </summary>
+internal readonly record struct BarFetchKey(
+    string Symbol,
+    DateTime FromUtc,
+    DateTime ToUtc,
+    BarTimeframe Timeframe);
+
 public sealed class PolygonBarFetcher : IPolygonBarFetcher
 {
     private readonly IStocksService m_Stocks;
     private readonly ILogger<PolygonBarFetcher> m_Logger;
+    private readonly SingleFlight<BarFetchKey, IReadOnlyList<Bar>> m_Coalescer = new();
 
     /// <summary>
     /// Default per-call ceiling. Now enforced by <c>PerCallTimeoutHandler</c>
@@ -86,7 +99,28 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
     {
     }
 
-    public async Task<IReadOnlyList<Bar>> FetchBarsAsync(
+    /// <summary>
+    /// Coalescer-wrapped public entry: 100 concurrent callers asking for
+    /// the same (symbol, range, timeframe) collapse to a single
+    /// <see cref="FetchBarsAsync_Inner"/> upstream call. Late joiners
+    /// share the originator's <see cref="CancellationToken"/>.
+    /// </summary>
+    public Task<IReadOnlyList<Bar>> FetchBarsAsync(
+        string inSymbol, DateTime inFromUtc, DateTime inToUtc,
+        BarTimeframe inTimeframe, CancellationToken inCt)
+    {
+        var tmpKey = new BarFetchKey(inSymbol, inFromUtc, inToUtc, inTimeframe);
+        return m_Coalescer.ExecuteAsync(tmpKey,
+            () => FetchBarsAsync_Inner(inSymbol, inFromUtc, inToUtc, inTimeframe, inCt));
+    }
+
+    /// <summary>
+    /// Diagnostic: in-flight coalescer entries. Surfaced via micro-PR #8
+    /// stats endpoint; tests also assert this drops to zero post-completion.
+    /// </summary>
+    internal int InFlightCount => m_Coalescer.InFlightCount;
+
+    private async Task<IReadOnlyList<Bar>> FetchBarsAsync_Inner(
         string inSymbol, DateTime inFromUtc, DateTime inToUtc,
         BarTimeframe inTimeframe, CancellationToken inCt)
     {
