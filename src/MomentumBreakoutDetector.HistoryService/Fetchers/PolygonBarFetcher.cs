@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Net;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Concurrency;
 using MomentumBreakoutDetector.HistoryService.Domain;
 using MomentumBreakoutDetector.HistoryService.Observability;
@@ -91,21 +90,6 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
         // so GetCacheStats can report live concurrency without an extra
         // backchannel.
         m_Metrics?.RegisterInFlightProbe(MetricKind.Bars, () => m_Coalescer.InFlightCount);
-    }
-
-    /// <summary>
-    /// IOptions overload retained for parity with the legacy ctor surface
-    /// — DI bindings and tests that previously bound an
-    /// <see cref="IOptions{HistoryServiceOptions}"/> still resolve.
-    /// The options bag is unused: timeouts + concurrency live in the
-    /// pipeline handlers now.
-    /// </summary>
-    public PolygonBarFetcher(
-        IStocksService inStocks,
-        IOptions<HistoryServiceOptions> _,
-        ILogger<PolygonBarFetcher> inLogger)
-        : this(inStocks, inLogger, inMetrics: null)
-    {
     }
 
     /// <summary>

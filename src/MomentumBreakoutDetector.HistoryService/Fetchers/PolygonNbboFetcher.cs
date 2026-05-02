@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService.Concurrency;
 using MomentumBreakoutDetector.HistoryService.Observability;
 using TreyThomasCodes.Polygon.RestClient.Exceptions;
@@ -61,20 +60,6 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
         m_Logger = inLogger;
         m_Metrics = inMetrics;
         m_Metrics?.RegisterInFlightProbe(MetricKind.Nbbo, () => m_Coalescer.InFlightCount);
-    }
-
-    /// <summary>
-    /// IOptions overload retained for parity with the legacy ctor surface
-    /// — DI bindings that previously bound <see cref="IOptions{HistoryServiceOptions}"/>
-    /// still resolve. The options bag is unused: timeouts + concurrency
-    /// live in the pipeline handlers now.
-    /// </summary>
-    public PolygonNbboFetcher(
-        IOptionsService inOptions,
-        IOptions<HistoryServiceOptions> _,
-        ILogger<PolygonNbboFetcher> inLogger)
-        : this(inOptions, inLogger, inMetrics: null)
-    {
     }
 
     /// <summary>
