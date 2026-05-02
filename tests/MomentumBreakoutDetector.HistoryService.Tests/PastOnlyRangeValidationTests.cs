@@ -1,0 +1,578 @@
+using Google.Protobuf.WellKnownTypes;
+using Grpc.Core;
+using Microsoft.Extensions.Logging.Abstractions;
+using MomentumBreakoutDetector.HistoryService.Contracts.V1;
+using MomentumBreakoutDetector.HistoryService.Fetchers;
+using MomentumBreakoutDetector.HistoryService.Providers;
+using MomentumBreakoutDetector.HistoryService.Validation;
+using Shouldly;
+using Xunit;
+using DomainBar = MomentumBreakoutDetector.HistoryService.Domain.Bar;
+using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTimeframe;
+
+namespace MomentumBreakoutDetector.HistoryService.Tests;
+
+/// <summary>
+/// Past-day-only invariant. history-service serves data strictly before
+/// the today-in-ET boundary; today's data must come from MBD-local. Any
+/// request whose range or point timestamp lands on or after the boundary
+/// is rejected with FAILED_PRECONDITION before any data fetch.
+///
+/// These tests run against <see cref="HistoryServiceImpl"/> directly
+/// (server-side method invocation) with stub providers that throw if
+/// invoked — proving the validator short-circuits before hitting the
+/// data layer. Using stubs (not Testcontainers) keeps the suite fast and
+/// hermetic.
+///
+/// Boundary semantics under test:
+///   ✓ All-past range:                              succeeds
+///   ✗ Range ending exactly at boundary:            rejected
+///   ✗ Range entirely in the future:                rejected
+///   ✗ Straddling range (from past, to ≥ boundary): rejected (no truncation)
+/// </summary>
+public sealed class PastOnlyRangeValidationTests
+{
+    // ─────────────────────────────────────────────────────────────────
+    // Boundary helper. Mirrors PastOnlyRangeValidator's computation so
+    // tests use the exact same instant the production code rejects on.
+    // ─────────────────────────────────────────────────────────────────
+    private static DateTime TodayBoundaryUtc()
+    {
+        var tmpEt = ResolveEasternTz();
+        var tmpNowEt = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tmpEt);
+        var tmpMidnight = new DateTime(
+            tmpNowEt.Year, tmpNowEt.Month, tmpNowEt.Day, 0, 0, 0, DateTimeKind.Unspecified);
+        return TimeZoneInfo.ConvertTimeToUtc(tmpMidnight, tmpEt);
+    }
+
+    private static TimeZoneInfo ResolveEasternTz()
+    {
+        try { return TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); }
+        catch (TimeZoneNotFoundException) { return TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // GetBars
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetBars_AllPastRange_PassesValidationAndReachesProvider()
+    {
+        // Range entirely a week ago → must NOT throw FailedPrecondition.
+        // We use a stub that returns 0 bars so the call completes cleanly
+        // once the validator has cleared.
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(-7);
+        var tmpToUtc = tmpBoundary.AddDays(-7).AddHours(1);
+
+        var tmpImpl = NewImplWith(new RecordingBarsProvider());
+        var tmpRequest = NewBarsRequest(tmpFromUtc, tmpToUtc);
+
+        var tmpResp = await tmpImpl.GetBars(tmpRequest, NewServerCallContext());
+        // Reaching here without an RpcException is the success criterion;
+        // an empty bar list is fine.
+        tmpResp.Bars.Count.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task GetBars_RangeEndingAtBoundary_IsRejected()
+    {
+        // to == boundary means "request includes today's first
+        // millisecond" → reject.
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(-1);
+        var tmpToUtc = tmpBoundary;
+
+        var tmpImpl = NewImplWith(new ThrowingBarsProvider());
+        var tmpRequest = NewBarsRequest(tmpFromUtc, tmpToUtc);
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetBars(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpEx.Status.Detail.ShouldContain("past-day data only");
+        tmpEx.Status.Detail.ShouldContain("ET");
+    }
+
+    [Fact]
+    public async Task GetBars_RangeEntirelyInFuture_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(1);
+        var tmpToUtc = tmpBoundary.AddDays(2);
+
+        var tmpImpl = NewImplWith(new ThrowingBarsProvider());
+        var tmpRequest = NewBarsRequest(tmpFromUtc, tmpToUtc);
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetBars(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+    }
+
+    [Fact]
+    public async Task GetBars_StraddlingRange_IsRejected_NotSilentlyTruncated()
+    {
+        // from in the past, to in the future. Must NOT truncate; the
+        // whole request fails so the caller can surface a router bug.
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(-1);
+        var tmpToUtc = tmpBoundary.AddHours(1);
+
+        var tmpProvider = new ThrowingBarsProvider();
+        var tmpImpl = NewImplWith(tmpProvider);
+        var tmpRequest = NewBarsRequest(tmpFromUtc, tmpToUtc);
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetBars(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        // Provider must NOT have been touched — that would mean we
+        // tried to fetch the truncated past portion silently.
+        tmpProvider.WasInvoked.ShouldBeFalse();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // GetNbbo (point timestamp)
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetNbbo_PastTimestamp_PassesValidation()
+    {
+        // We need a quotes provider that doesn't throw — return a miss.
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpTsUtc = tmpBoundary.AddDays(-3);
+
+        var tmpQuotes = new RecordingQuotesProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: tmpQuotes,
+            macroProvider: null);
+
+        var tmpRequest = new GetNbboRequest
+        {
+            Ticker = "O:TSLA241220C00250000",
+            Ts = Timestamp.FromDateTime(tmpTsUtc),
+        };
+
+        var tmpResp = await tmpImpl.GetNbbo(tmpRequest, NewServerCallContext());
+        tmpResp.ShouldNotBeNull();
+        tmpQuotes.WasInvoked.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task GetNbbo_TimestampAtBoundary_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpQuotes = new ThrowingQuotesProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: tmpQuotes);
+
+        var tmpRequest = new GetNbboRequest
+        {
+            Ticker = "O:TSLA241220C00250000",
+            Ts = Timestamp.FromDateTime(tmpBoundary),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetNbbo(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+    }
+
+    [Fact]
+    public async Task GetNbbo_FutureTimestamp_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpQuotes = new ThrowingQuotesProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: tmpQuotes);
+
+        var tmpRequest = new GetNbboRequest
+        {
+            Ticker = "O:TSLA241220C00250000",
+            Ts = Timestamp.FromDateTime(tmpBoundary.AddHours(8)), // sometime later today/tomorrow
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetNbbo(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpQuotes.WasInvoked.ShouldBeFalse();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // GetOptionChain (single as-of-date)
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetOptionChain_PastAsOfDate_PassesValidation()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpAsOf = tmpBoundary.AddDays(-5);
+
+        var tmpChain = new RecordingChainProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: tmpChain);
+
+        var tmpRequest = new GetOptionChainRequest
+        {
+            UnderlyingTicker = "TSLA",
+            AsOfDate = Timestamp.FromDateTime(tmpAsOf),
+        };
+
+        var tmpResp = await tmpImpl.GetOptionChain(tmpRequest, NewServerCallContext());
+        tmpResp.ShouldNotBeNull();
+        tmpChain.WasInvoked.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task GetOptionChain_AsOfAtBoundary_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpChain = new ThrowingChainProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: tmpChain);
+
+        var tmpRequest = new GetOptionChainRequest
+        {
+            UnderlyingTicker = "TSLA",
+            AsOfDate = Timestamp.FromDateTime(tmpBoundary),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetOptionChain(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpChain.WasInvoked.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetOptionChain_FutureAsOfDate_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpChain = new ThrowingChainProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: tmpChain);
+
+        var tmpRequest = new GetOptionChainRequest
+        {
+            UnderlyingTicker = "TSLA",
+            AsOfDate = Timestamp.FromDateTime(tmpBoundary.AddDays(3)),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetOptionChain(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+    }
+
+    // GetOptionChain treats as_of as a single point — there's no
+    // "straddling range" case for it. The other three RPCs cover that.
+
+    // ─────────────────────────────────────────────────────────────────
+    // GetMacro
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetMacro_AllPastRange_PassesValidation()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(-30);
+        var tmpToUtc = tmpBoundary.AddDays(-1);
+
+        var tmpMacro = new RecordingMacroProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: tmpMacro);
+
+        var tmpRequest = new GetMacroRequest
+        {
+            SeriesId = "T10Y2Y",
+            FromDate = Timestamp.FromDateTime(tmpFromUtc),
+            ToDate = Timestamp.FromDateTime(tmpToUtc),
+        };
+
+        var tmpResp = await tmpImpl.GetMacro(tmpRequest, NewServerCallContext());
+        tmpResp.ShouldNotBeNull();
+        tmpMacro.WasInvoked.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task GetMacro_RangeEndingAtBoundary_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpMacro = new ThrowingMacroProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: tmpMacro);
+
+        var tmpRequest = new GetMacroRequest
+        {
+            SeriesId = "T10Y2Y",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-7)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetMacro(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpMacro.WasInvoked.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetMacro_RangeEntirelyInFuture_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpMacro = new ThrowingMacroProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: tmpMacro);
+
+        var tmpRequest = new GetMacroRequest
+        {
+            SeriesId = "T10Y2Y",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(1)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary.AddDays(7)),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetMacro(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+    }
+
+    [Fact]
+    public async Task GetMacro_StraddlingRange_IsRejected_NotSilentlyTruncated()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpMacro = new ThrowingMacroProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: tmpMacro);
+
+        var tmpRequest = new GetMacroRequest
+        {
+            SeriesId = "T10Y2Y",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-14)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary.AddDays(2)),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetMacro(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpMacro.WasInvoked.ShouldBeFalse();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Direct validator unit checks. Belt-and-braces — exercises the
+    // helper without going through the gRPC surface.
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Validator_PastRange_DoesNotThrow()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        Should.NotThrow(() => PastOnlyRangeValidator.EnsurePastOnly(
+            tmpBoundary.AddDays(-2), tmpBoundary.AddDays(-1)));
+    }
+
+    [Fact]
+    public void Validator_BoundaryEqualToTo_Throws()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpEx = Should.Throw<RpcException>(() => PastOnlyRangeValidator.EnsurePastOnly(
+            tmpBoundary.AddDays(-1), tmpBoundary));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+    }
+
+    [Fact]
+    public void Validator_PointAtBoundary_Throws()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpEx = Should.Throw<RpcException>(() => PastOnlyRangeValidator.EnsurePastOnly(tmpBoundary));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+    }
+
+    [Fact]
+    public void Validator_PointInPast_DoesNotThrow()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        Should.NotThrow(() => PastOnlyRangeValidator.EnsurePastOnly(tmpBoundary.AddSeconds(-1)));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Wiring helpers + stub providers.
+    // ─────────────────────────────────────────────────────────────────
+
+    private static HistoryServiceImpl NewImplWith(IHistoricalBarsProvider inBars)
+        => new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            inBars,
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null);
+
+    private static GetBarsRequest NewBarsRequest(DateTime inFromUtc, DateTime inToUtc)
+        => new()
+        {
+            Symbol = "TSLA",
+            Timeframe = BarTimeframe.Minute,
+            FromTs = Timestamp.FromDateTime(DateTime.SpecifyKind(inFromUtc, DateTimeKind.Utc)),
+            ToTs = Timestamp.FromDateTime(DateTime.SpecifyKind(inToUtc, DateTimeKind.Utc)),
+        };
+
+    private static ServerCallContext NewServerCallContext()
+        => new TestServerCallContext(CancellationToken.None);
+
+    private sealed class TestServerCallContext : ServerCallContext
+    {
+        private readonly CancellationToken m_Ct;
+        public TestServerCallContext(CancellationToken inCt) { m_Ct = inCt; }
+        protected override string MethodCore => "/mbd.history.v1.HistoryService/Test";
+        protected override string HostCore => "localhost";
+        protected override string PeerCore => "test";
+        protected override DateTime DeadlineCore => DateTime.UtcNow.AddSeconds(30);
+        protected override Metadata RequestHeadersCore => new();
+        protected override CancellationToken CancellationTokenCore => m_Ct;
+        protected override Metadata ResponseTrailersCore => new();
+        protected override Status StatusCore { get; set; }
+        protected override WriteOptions? WriteOptionsCore { get; set; }
+        protected override AuthContext AuthContextCore => new("", new Dictionary<string, List<AuthProperty>>());
+        protected override ContextPropagationToken CreatePropagationTokenCore(ContextPropagationOptions? options)
+            => throw new NotSupportedException();
+        protected override Task WriteResponseHeadersAsyncCore(Metadata responseHeaders) => Task.CompletedTask;
+    }
+
+    /// <summary>Records that it was called and returns an empty result.</summary>
+    private sealed class RecordingBarsProvider : IHistoricalBarsProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<BarsReadResult> GetBarsAsync(string inSymbol, DateTime inFromUtc, DateTime inToUtc,
+            DomainBarTimeframe inTimeframe, CancellationToken inCt = default)
+        {
+            WasInvoked = true;
+            return Task.FromResult(new BarsReadResult(Array.Empty<DomainBar>(), CacheHit: false));
+        }
+        public Task<int> EnsureRangeCachedAsync(string inSymbol, DateTime inFromUtc, DateTime inToUtc,
+            DomainBarTimeframe inTimeframe,
+            Func<BarsWarmupProgress, CancellationToken, Task>? inProgress = null, CancellationToken inCt = default)
+            => Task.FromResult(0);
+    }
+
+    /// <summary>Throws if invoked — proves the validator short-circuits.</summary>
+    private sealed class ThrowingBarsProvider : IHistoricalBarsProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<BarsReadResult> GetBarsAsync(string inSymbol, DateTime inFromUtc, DateTime inToUtc,
+            DomainBarTimeframe inTimeframe, CancellationToken inCt = default)
+        {
+            WasInvoked = true;
+            throw new InvalidOperationException("Bars provider must not be invoked when validation rejects the range.");
+        }
+        public Task<int> EnsureRangeCachedAsync(string inSymbol, DateTime inFromUtc, DateTime inToUtc,
+            DomainBarTimeframe inTimeframe,
+            Func<BarsWarmupProgress, CancellationToken, Task>? inProgress = null, CancellationToken inCt = default)
+            => throw new InvalidOperationException("Should not be invoked.");
+    }
+
+    private sealed class RecordingQuotesProvider : IOptionQuotesProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<OptionQuotesLookup> GetAtOrBeforeAsync(string inTicker, DateTime inTsUtc, CancellationToken inCt = default)
+        {
+            WasInvoked = true;
+            return Task.FromResult(new OptionQuotesLookup(Quote: null, CacheHit: false, IsMissMarker: true));
+        }
+    }
+
+    private sealed class ThrowingQuotesProvider : IOptionQuotesProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<OptionQuotesLookup> GetAtOrBeforeAsync(string inTicker, DateTime inTsUtc, CancellationToken inCt = default)
+        {
+            WasInvoked = true;
+            throw new InvalidOperationException("Quotes provider must not be invoked when validation rejects.");
+        }
+    }
+
+    private sealed class RecordingChainProvider : IOptionChainProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<OptionChainResult> GetChainAsync(string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
+        {
+            WasInvoked = true;
+            return Task.FromResult(new OptionChainResult(Array.Empty<OptionContractRow>(), CacheHit: false, IsMissMarker: false));
+        }
+        public Task EnsureChainCachedAsync(string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
+            => Task.CompletedTask;
+    }
+
+    private sealed class ThrowingChainProvider : IOptionChainProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<OptionChainResult> GetChainAsync(string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
+        {
+            WasInvoked = true;
+            throw new InvalidOperationException("Chain provider must not be invoked when validation rejects.");
+        }
+        public Task EnsureChainCachedAsync(string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
+            => throw new InvalidOperationException("Should not be invoked.");
+    }
+
+    private sealed class RecordingMacroProvider : IMacroDataProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<IReadOnlyList<FredObservationRow>> GetSeriesAsync(string seriesId, DateOnly fromDate, DateOnly toDate, CancellationToken ct)
+        {
+            WasInvoked = true;
+            return Task.FromResult<IReadOnlyList<FredObservationRow>>(Array.Empty<FredObservationRow>());
+        }
+        public Task EnsureRangeCachedAsync(string seriesId, DateOnly fromDate, DateOnly toDate, CancellationToken ct)
+        {
+            WasInvoked = true;
+            return Task.CompletedTask;
+        }
+        public Task EnsureRangeCachedAsync(IEnumerable<string> seriesIds, DateOnly fromDate, DateOnly toDate, CancellationToken ct)
+        {
+            WasInvoked = true;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class ThrowingMacroProvider : IMacroDataProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<IReadOnlyList<FredObservationRow>> GetSeriesAsync(string seriesId, DateOnly fromDate, DateOnly toDate, CancellationToken ct)
+        {
+            WasInvoked = true;
+            throw new InvalidOperationException("Macro provider must not be invoked when validation rejects.");
+        }
+        public Task EnsureRangeCachedAsync(string seriesId, DateOnly fromDate, DateOnly toDate, CancellationToken ct)
+        {
+            WasInvoked = true;
+            throw new InvalidOperationException("Macro provider must not be invoked when validation rejects.");
+        }
+        public Task EnsureRangeCachedAsync(IEnumerable<string> seriesIds, DateOnly fromDate, DateOnly toDate, CancellationToken ct)
+        {
+            WasInvoked = true;
+            throw new InvalidOperationException("Macro provider must not be invoked when validation rejects.");
+        }
+    }
+}

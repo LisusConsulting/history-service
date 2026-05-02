@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using MomentumBreakoutDetector.HistoryService.Contracts.V1;
 using MomentumBreakoutDetector.HistoryService.Observability;
 using MomentumBreakoutDetector.HistoryService.Providers;
+using MomentumBreakoutDetector.HistoryService.Validation;
 using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTimeframe;
 using V1Bar = MomentumBreakoutDetector.HistoryService.Contracts.V1.Bar;
 
@@ -76,6 +77,10 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         var toUtc = request.ToTs.ToDateTime();
         var timeframe = MapTimeframe(request.Timeframe);
 
+        // Past-day-only guard. Reject requests whose range includes
+        // today or later — today's data lives in MBD-local, not here.
+        PastOnlyRangeValidator.EnsurePastOnly(fromUtc, toUtc);
+
         _logger.LogInformation(
             "GetBars symbol={Symbol} timeframe={Timeframe} from={From:O} to={To:O}",
             request.Symbol, timeframe, fromUtc, toUtc);
@@ -136,6 +141,11 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         }
 
         var tmpTsUtc = request.Ts.ToDateTime();
+
+        // Past-day-only guard. Reject point timestamps at or beyond the
+        // today-in-ET boundary; today's NBBO lives in MBD-local.
+        PastOnlyRangeValidator.EnsurePastOnly(tmpTsUtc);
+
         _logger.LogInformation("GetNbbo ticker={Ticker} ts={Ts:O}", request.Ticker, tmpTsUtc);
 
         var tmpLookup = await _quotes
@@ -190,6 +200,10 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         // the contract's comment on as_of_date says so.
         var tmpAsOfUtc = request.AsOfDate.ToDateTime();
         var tmpAsOfDate = DateOnly.FromDateTime(tmpAsOfUtc);
+
+        // Past-day-only guard. as_of_date is a single point; reject if
+        // it lands on or after the today-in-ET boundary.
+        PastOnlyRangeValidator.EnsurePastOnly(tmpAsOfUtc);
 
         var tmpResult = await _optionChainProvider.GetChainAsync(
             request.UnderlyingTicker, tmpAsOfDate, context.CancellationToken);
@@ -300,6 +314,14 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
             throw new RpcException(new Status(
                 StatusCode.InvalidArgument, "from_date must be <= to_date."));
         }
+
+        // Past-day-only guard. Reject ranges that touch today or
+        // beyond. We pass the original UTC instants so the boundary
+        // comparison runs at full timestamp resolution (not rounded to
+        // a calendar date).
+        PastOnlyRangeValidator.EnsurePastOnly(
+            request.FromDate.ToDateTime(),
+            request.ToDate.ToDateTime());
 
         // Quick cache-hit probe: if the cache already covers the requested
         // window, EnsureRangeCached short-circuits with no FRED calls and
