@@ -102,8 +102,16 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
             "TSLA", tmpFromTs, tmpToTs, DomainBarTimeframe.OneMinute,
             inProgress: null, inCt: CancellationToken.None);
 
-        // Give the warmup time to enter the fetcher's SingleFlight.
-        await Task.Delay(100).ConfigureAwait(false);
+        // Poll until the warmup has arrived at the fetcher boundary
+        // (Arrivals==1) — guarantees the SingleFlight slot is open and
+        // parked at the gate when point fetches start queueing.
+        var tmpDeadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < tmpDeadline)
+        {
+            if (tmpStub.Arrivals >= 1) break;
+            await Task.Delay(20).ConfigureAwait(false);
+        }
+        tmpStub.Arrivals.ShouldBe(1, "warmup must reach the fetcher before point-fetches start");
 
         var tmpPointFetchTasks = new Task<BarsReadResult>[50];
         for (var i = 0; i < 50; i++)
@@ -112,8 +120,18 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
                 "TSLA", tmpFromTs, tmpToTs, DomainBarTimeframe.OneMinute);
         }
 
-        // Give all 50 point-fetches a moment to converge on SingleFlight.
-        await Task.Delay(200).ConfigureAwait(false);
+        // Wait until all 51 callers (warmup + 50 point-fetches) have
+        // arrived at the fetcher boundary. The stub's Arrivals counter
+        // increments BEFORE SingleFlight, so 51 arrivals proves every
+        // caller is queued at the gate (CallCount stays 1 because the
+        // factory only runs once).
+        tmpDeadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < tmpDeadline)
+        {
+            if (tmpStub.Arrivals >= 51) break;
+            await Task.Delay(20).ConfigureAwait(false);
+        }
+        tmpStub.Arrivals.ShouldBe(51, "all 51 callers (warmup + 50 point-fetches) must reach SingleFlight before release");
         tmpStub.ReleaseGate();
 
         var tmpUpstreamCalls = await tmpWarmupTask.ConfigureAwait(false);
@@ -218,10 +236,15 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
         private readonly IReadOnlyList<DomainBar> m_Bars;
         private readonly int m_DelayMs;
         private int m_Calls;
+        private int m_Arrivals;
         private readonly MomentumBreakoutDetector.HistoryService.Concurrency.SingleFlight<BarFetchKey, IReadOnlyList<DomainBar>> m_Coalescer = new();
         private TaskCompletionSource? m_Gate;
 
         public int CallCount => Volatile.Read(ref m_Calls);
+        // Arrivals counts every FetchBarsAsync entry pre-SingleFlight —
+        // lets tests poll for "all expected callers have arrived"
+        // before releasing the gate.
+        public int Arrivals => Volatile.Read(ref m_Arrivals);
 
         public SlowCountingStub(IReadOnlyList<DomainBar> inBars, int delayMs)
         {
@@ -244,6 +267,7 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
             string inSymbol, DateTime inFromUtc, DateTime inToUtc,
             DomainBarTimeframe inTimeframe, CancellationToken inCt)
         {
+            Interlocked.Increment(ref m_Arrivals);
             // Important: this stub stands in for PolygonBarFetcher, which
             // owns the SingleFlight coalescer. Replicating that here means
             // the test exercises the correct semantics — concurrent

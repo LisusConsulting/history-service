@@ -210,11 +210,21 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
             .Select(_ => tmpHarness.Service.GetBars(tmpReq, NewServerCallContext()))
             .ToArray();
 
-        // Give all 50 tasks a moment to enter the SingleFlight slot, then
-        // release the gate so the coalesced fetch resolves.
-        await Task.Delay(200);
-        tmpHarness.BarFetcher.ReleaseGate();
+        // Poll until all 50 callers have arrived at the fetcher's
+        // SingleFlight (Arrivals counts every entry pre-coalesce).
+        // CallCount stays at 1 because they all share the same gated
+        // factory invocation. Polling beats a fixed Task.Delay because
+        // gap-detection postgres queries can take seconds on slow CI.
+        var tmpDeadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < tmpDeadline)
+        {
+            if (tmpHarness.BarFetcher.Arrivals >= 50) break;
+            await Task.Delay(20);
+        }
+        tmpHarness.BarFetcher.Arrivals.ShouldBe(50,
+            "all 50 concurrent callers must reach the fetcher boundary before release");
 
+        tmpHarness.BarFetcher.ReleaseGate();
         await Task.WhenAll(tmpTasks);
 
         tmpTasks.All(t => t.Result.Bars.Count == 5).ShouldBeTrue();
@@ -502,6 +512,11 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
         private readonly MomentumBreakoutDetector.HistoryService.Concurrency.SingleFlight<
             (string, DateTime, DateTime, DomainBarTimeframe), IReadOnlyList<DomainBar>> m_Coalescer = new();
         public int CallCount;
+        // Increments BEFORE the SingleFlight call — counts arrivals at
+        // the fetcher boundary regardless of whether they coalesce. Lets
+        // the test poll for "all 50 callers have arrived" before
+        // releasing the gate.
+        public int Arrivals;
 
         // Optional gate — when set, the fetch awaits the gate before
         // returning. Lets the coalesce-proof test ensure every concurrent
@@ -533,6 +548,10 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
             string inSymbol, DateTime inFromUtc, DateTime inToUtc,
             DomainBarTimeframe inTimeframe, CancellationToken inCt)
         {
+            // Arrivals counts every call regardless of coalescing —
+            // tests poll this to know when all expected concurrent
+            // callers are queued at SingleFlight.
+            Interlocked.Increment(ref Arrivals);
             var tmpKey = (inSymbol, inFromUtc, inToUtc, inTimeframe);
             return m_Coalescer.ExecuteAsync(tmpKey,
                 () => DoFetchAsync(inSymbol, inFromUtc, inToUtc, inTimeframe, inCt));
