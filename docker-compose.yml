@@ -44,7 +44,12 @@ services:
     environment:
       # Two endpoints, two ports: gRPC requires h2c (Http2-only) on 8080,
       # /health and the JSON banner are HTTP/1 on 8081.
-      ASPNETCORE_ENVIRONMENT: "Development"
+      # Production disables ValidateScopes — the polygon-net-client SDK 0.10.0
+      # registers FluentValidation IValidator<T> as Scoped, but the fetchers
+      # (Singletons) resolve them transitively, which Development mode rejects.
+      # Proper fix is upstream in polygon-net-client (singleton validators);
+      # for now Production gets us booting cleanly.
+      ASPNETCORE_ENVIRONMENT: "Production"
       History__ConnectionString: "Host=mbd-history-postgres;Port=5432;Database=mbd_history;Username=mbd;Password=mbd"
       # Polygon REST API key. Source from .env / shell. Fetcher fail-quiets
       # on 401/403 so an unset key surfaces as zero-bar responses + warn

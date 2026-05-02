@@ -23,6 +23,11 @@ logs/
 # Local scratch (seeder checkpoints, ad-hoc smoke runs, etc.)
 .tmp/
 
+# Seeder operator artifacts — checkpoints + per-symbol run logs.
+# Both are local state; not source-controllable.
+tools/seed/checkpoint.*.json
+tools/seed/seed.*.log
+
 # Environment / secrets
 .env
 .env.local
