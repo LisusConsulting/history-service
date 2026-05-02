@@ -185,10 +185,16 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
     {
         await using var tmpConn = new NpgsqlConnection(m_ConnectionString);
         await tmpConn.OpenAsync(inCt).ConfigureAwait(false);
+        // Range-shape lookup (post-PR #3): a row with range_from <= ts <=
+        // range_to means we already tried this minute (or a contiguous run
+        // that includes it) and upstream had nothing. Faster on average
+        // than the old (ticker, ts) point lookup because adjacent
+        // single-minute writes coalesce into one range, so this predicate
+        // hits fewer index entries per ticker.
         var tmpHit = await tmpConn.ExecuteScalarAsync<int?>(
             """
             SELECT 1 FROM historical_options_quotes_misses
-            WHERE ticker = @Ticker AND ts = @Ts
+            WHERE ticker = @Ticker AND range_from <= @Ts AND range_to >= @Ts
             LIMIT 1
             """,
             new { Ticker = inTicker, Ts = inTsUtc }).ConfigureAwait(false);
@@ -230,14 +236,29 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
         {
             await using var tmpConn = new NpgsqlConnection(m_ConnectionString);
             await tmpConn.OpenAsync(inCt).ConfigureAwait(false);
-            await tmpConn.ExecuteAsync(
-                """
-                INSERT INTO historical_options_quotes_misses (ticker, ts, reason, recorded_at)
-                VALUES (@Ticker, @Ts, @Reason, NOW())
-                ON CONFLICT (ticker, ts) DO NOTHING
-                """,
-                new { Ticker = inTicker, Ts = inTsUtc, Reason = inReason })
-                .ConfigureAwait(false);
+
+            // Write as a degenerate 1-minute range marker. The
+            // RangeMarkerWriter coalesces with adjacent existing markers
+            // (within 1 minute of an existing range_from/range_to) so
+            // sequential single-call writes for contiguous minutes collapse
+            // into one range row over time. This is the principle from
+            // brief 2026-05-02: store missing data as ranges, not points.
+            //
+            // Adjacency = 1 minute (60s in ticks). Two markers separated
+            // by exactly 60s collapse; >60s stays separate. NBBO grid is
+            // already minute-aligned upstream so this matches our cadence
+            // exactly.
+            var tmpRange = new DateTimeOffset(DateTime.SpecifyKind(inTsUtc, DateTimeKind.Utc));
+            await RangeMarkerWriter.WriteAsync(
+                tmpConn, NbboMissTableSpec,
+                inKeyValues: new[]
+                {
+                    new KeyValuePair<string, object>("Ticker", inTicker),
+                },
+                inNewRanges: new[] { (tmpRange, tmpRange) },
+                inReason: inReason,
+                inAdjacencyTicks: TimeSpan.FromMinutes(1).Ticks,
+                inCt: inCt).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -249,6 +270,20 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
                 inTicker, inTsUtc);
         }
     }
+
+    /// <summary>
+    /// Schema descriptor for <c>historical_options_quotes_misses</c>
+    /// (range-shape post migration 009). Bound at class scope so tests
+    /// can refer to it for setup.
+    /// </summary>
+    internal static readonly RangeMarkerTableSpec NbboMissTableSpec = new(
+        TableName: "historical_options_quotes_misses",
+        KeyColumns: new[] { "ticker" },
+        RangeFromColumn: "range_from",
+        RangeToColumn: "range_to",
+        FetchedAtColumn: "fetched_at",
+        HasReasonColumn: true,
+        ReasonColumn: "reason");
 
     private static OptionQuoteRecord ToRecord(PolygonNbboResult inResult)
         => new(

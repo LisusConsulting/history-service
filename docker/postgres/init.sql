@@ -15,3 +15,7 @@
 \i /docker-entrypoint-initdb.d/migrations/004-create-macro-data.sql
 \i /docker-entrypoint-initdb.d/migrations/005-create-miss-markers.sql
 \i /docker-entrypoint-initdb.d/migrations/006-create-cache-stats.sql
+-- 009 is a no-op on fresh volumes (the v1 schema with `ts` column is
+-- never created here), but we list it so the file order stays in sync
+-- with the migrations directory and the Phase 2 deployment plan.
+\i /docker-entrypoint-initdb.d/migrations/009-nbbo-misses-range-shape.sql
