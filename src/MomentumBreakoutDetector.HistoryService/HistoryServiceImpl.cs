@@ -388,6 +388,13 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
                 "from_ts must be <= to_ts"));
         }
 
+        // Past-day-only guard. Streaming handlers must validate BEFORE the
+        // first Yield. Throwing RpcException here is safe: the gRPC runtime
+        // closes the stream with FAILED_PRECONDITION and the client receives
+        // the same error semantics as a rejected unary RPC. No progress
+        // messages are emitted, so the progress contract is not violated.
+        PastOnlyRangeValidator.EnsurePastOnly(fromUtc, toUtc);
+
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         _logger.LogInformation(
             "EnsureRangeCached symbols=[{Symbols}] classes=[{Classes}] from={From:O} to={To:O}",
