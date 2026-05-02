@@ -46,19 +46,39 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
     public const int DefaultPerCallTimeoutMs = 3000;
     public const int DefaultMaxConcurrentFetches = 8;
 
+    /// <summary>
+    /// Maximum allowed age of a returned quote relative to the requested
+    /// bucket timestamp. /v3/quotes with <c>timestamp.lte</c> returns the
+    /// most-recent NBBO at-or-before the bucket — for a contract that
+    /// hasn't ticked yet in the session (e.g. Tuesday 09:30 open for an
+    /// option last quoted Friday 16:14 close), Polygon returns the
+    /// stale prior-session quote. Without this gate that quote would be
+    /// persisted under the Tuesday-open bucket as if it were today's
+    /// data. 300s mirrors the read-side fuzzy at-or-before window in
+    /// <see cref="OptionQuotesProvider.DefaultStaleQuoteToleranceSeconds"/>:
+    /// reads tolerate up to 5 min of staleness, so writes must too — but
+    /// no more.
+    /// </summary>
+    public const int DefaultMaxQuoteAgeSeconds = 300;
+
     private readonly IOptionsService m_Options;
     private readonly ILogger<PolygonNbboFetcher> m_Logger;
     private readonly MetricsCollector? m_Metrics;
     private readonly SingleFlight<NbboFetchKey, PolygonNbboFetch> m_Coalescer = new();
+    private readonly int m_MaxQuoteAgeSeconds;
 
     public PolygonNbboFetcher(
         IOptionsService inOptions,
         ILogger<PolygonNbboFetcher> inLogger,
-        MetricsCollector? inMetrics = null)
+        MetricsCollector? inMetrics = null,
+        int inMaxQuoteAgeSeconds = DefaultMaxQuoteAgeSeconds)
     {
         m_Options = inOptions;
         m_Logger = inLogger;
         m_Metrics = inMetrics;
+        m_MaxQuoteAgeSeconds = inMaxQuoteAgeSeconds > 0
+            ? inMaxQuoteAgeSeconds
+            : DefaultMaxQuoteAgeSeconds;
         m_Metrics?.RegisterInFlightProbe(MetricKind.Nbbo, () => m_Coalescer.InFlightCount);
     }
 
@@ -125,6 +145,21 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
             var tmpAsOf = DateTimeOffset
                 .FromUnixTimeMilliseconds(tmpQuote.SipTimestamp.Value / 1_000_000L)
                 .UtcDateTime;
+
+            // Freshness gate: /v3/quotes with timestamp.lte returns the
+            // most-recent NBBO at-or-before the bucket — when a contract
+            // hasn't ticked yet in the session, that's a prior-session
+            // quote (e.g. Friday's 16:14 close for a Tuesday 09:30 bucket).
+            // Reject anything older than DefaultMaxQuoteAgeSeconds so we
+            // don't persist stale quotes under fresh-bucket keys.
+            var tmpAgeSec = (inTsUtc - tmpAsOf).TotalSeconds;
+            if (tmpAgeSec > m_MaxQuoteAgeSeconds)
+            {
+                m_Logger.LogInformation(
+                    "Polygon NBBO fetch: {Ticker} @ {Ts:O} → stale quote (sip={Sip:O}, age={AgeSec:F0}s > {MaxAgeSec}s); treating as miss",
+                    inTicker, inTsUtc, tmpAsOf, tmpAgeSec, m_MaxQuoteAgeSeconds);
+                return new PolygonNbboFetch(PolygonNbboOutcome.Miss, null, "stale-quote");
+            }
 
             return new PolygonNbboFetch(
                 PolygonNbboOutcome.Hit,
