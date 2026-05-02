@@ -614,6 +614,8 @@ public sealed class PastOnlyRangeValidationTests
         }
         public Task EnsureChainCachedAsync(string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
             => Task.CompletedTask;
+        public Task<int> EnsureRangeCachedAsync(string inSymbol, DateOnly inFromDate, DateOnly inToDate, CancellationToken inCt)
+            => Task.FromResult(0);
     }
 
     private sealed class ThrowingChainProvider : IOptionChainProvider
@@ -625,6 +627,8 @@ public sealed class PastOnlyRangeValidationTests
             throw new InvalidOperationException("Chain provider must not be invoked when validation rejects.");
         }
         public Task EnsureChainCachedAsync(string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
+            => throw new InvalidOperationException("Should not be invoked.");
+        public Task<int> EnsureRangeCachedAsync(string inSymbol, DateOnly inFromDate, DateOnly inToDate, CancellationToken inCt)
             => throw new InvalidOperationException("Should not be invoked.");
     }
 
