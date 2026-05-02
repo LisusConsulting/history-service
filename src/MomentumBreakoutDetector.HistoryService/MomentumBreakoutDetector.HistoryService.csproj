@@ -43,11 +43,19 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Server-side proto generation lives here; the Contracts project
-         generates the client. Keeping them separate so consumers only need
-         the Contracts NuGet package, not the whole service. -->
+    <!-- Server + Client proto generation. The Contracts project keeps
+         GrpcServices="Client" so external NuGet consumers get the lean
+         client-only surface. The service project itself emits Both so
+         internal tooling that ProjectReferences the service (seeder,
+         tests) can drive the gRPC server with a real client without
+         needing a separate Contracts ref (which would CS0433 on every
+         proto-generated type).
+
+         Originally Server-only, switched to Both during the gap-detection
+         rework when the seeder gained a ProjectReference to the service
+         project to share TradingCalendar (Domain). -->
     <Protobuf Include="..\MomentumBreakoutDetector.HistoryService.Contracts\Protos\history.proto"
-              GrpcServices="Server"
+              GrpcServices="Both"
               Link="Protos/history.proto" />
   </ItemGroup>
 

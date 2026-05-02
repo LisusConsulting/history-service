@@ -2,6 +2,11 @@ using System.Diagnostics;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using MomentumBreakoutDetector.HistoryService.Contracts.V1;
+// TradingCalendar lives in MomentumBreakoutDetector.HistoryService.Domain.
+// Pulled in via type-alias rather than `using namespace` because the Domain
+// namespace also defines BarTimeframe, which collides with the proto enum
+// of the same name in this file.
+using TradingCalendar = MomentumBreakoutDetector.HistoryService.Domain.TradingCalendar;
 // The generated gRPC client lives at
 // MomentumBreakoutDetector.HistoryService.Contracts.V1.HistoryServiceContainer.HistoryServiceClient.
 // Alias the static container so we don't collide with this assembly's

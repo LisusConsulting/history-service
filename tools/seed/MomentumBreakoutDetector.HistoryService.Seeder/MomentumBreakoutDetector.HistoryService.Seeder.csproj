@@ -12,8 +12,16 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Generated gRPC client + proto types live here. -->
-    <ProjectReference Include="..\..\..\src\MomentumBreakoutDetector.HistoryService.Contracts\MomentumBreakoutDetector.HistoryService.Contracts.csproj" />
+    <!-- TradingCalendar (Domain) lives in the main service project after
+         the gap-detection rework. The seeder uses the same calendar to
+         enumerate trading days + half-days. Keeping a single source of
+         truth across the seeder + providers avoids the holiday-list
+         drift bug-class.
+         Referencing the service project also pulls in the generated gRPC
+         types (the server-side Protobuf re-emit covers the Client surface
+         too), so we DON'T also reference the Contracts project — that
+         would surface CS0433 ambiguity on every proto-generated type. -->
+    <ProjectReference Include="..\..\..\src\MomentumBreakoutDetector.HistoryService\MomentumBreakoutDetector.HistoryService.csproj" />
   </ItemGroup>
 
   <ItemGroup>
