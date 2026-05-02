@@ -57,11 +57,12 @@ WHERE as_of_ts IS NOT NULL
 GROUP BY 1
 ORDER BY 2 DESC;
 
--- The actual delete. Commented out — un-comment after Lisus confirms.
---
--- DELETE FROM historical_options_quotes
--- WHERE as_of_ts IS NOT NULL
---   AND as_of_ts < ts - INTERVAL '300 seconds';
+-- The actual delete. Lisus go/no-go received 2026-05-02; pre-flight
+-- count on mbd-history-postgres confirmed 19,948 rows matching the
+-- predicate (matching the gate-capture estimate).
+DELETE FROM historical_options_quotes
+WHERE as_of_ts IS NOT NULL
+  AND as_of_ts < ts - INTERVAL '300 seconds';
 
-ROLLBACK;
--- COMMIT;
+COMMIT;
+-- ROLLBACK;
