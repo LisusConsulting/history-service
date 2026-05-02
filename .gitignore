@@ -20,6 +20,9 @@ TestResults/
 logs/
 *.log
 
+# Local scratch (seeder checkpoints, ad-hoc smoke runs, etc.)
+.tmp/
+
 # Environment / secrets
 .env
 .env.local

@@ -2,6 +2,7 @@
   <Project Path="src/MomentumBreakoutDetector.HistoryService/MomentumBreakoutDetector.HistoryService.csproj" />
   <Project Path="src/MomentumBreakoutDetector.HistoryService.Contracts/MomentumBreakoutDetector.HistoryService.Contracts.csproj" />
   <Project Path="tests/MomentumBreakoutDetector.HistoryService.Tests/MomentumBreakoutDetector.HistoryService.Tests.csproj" />
+  <Project Path="tools/seed/MomentumBreakoutDetector.HistoryService.Seeder/MomentumBreakoutDetector.HistoryService.Seeder.csproj" />
   <!-- Phase E: source-level submodule for the Polygon SDK (0.10.0).
        Replaces the published TreyThomasCodes.Polygon.* NuGets so we can
        call into the new pluggable-handler-chain + Raw ApiResponse APIs. -->
