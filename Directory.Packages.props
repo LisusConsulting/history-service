@@ -22,6 +22,13 @@
          Submodule csprojs carry their own Directory.Packages.props for
          their transitive deps (Refit, FluentValidation, NodaTime). -->
 
+    <!-- Alpaca (stock bars). Polygon's plan doesn't include 1-min stock
+         bar history older than ~2 years, so stock bars route to Alpaca's
+         data API (uncapped history on the paid SIP feed). Options surface
+         (NBBO + chains) stays on Polygon. Same SDK + version used by MBD
+         to keep cross-repo upgrades trivial. -->
+    <PackageVersion Include="Alpaca.Markets" Version="7.2.0" />
+
     <!-- Microsoft.Extensions -->
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.5" />
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.5" />

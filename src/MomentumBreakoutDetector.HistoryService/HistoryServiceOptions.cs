@@ -47,4 +47,25 @@ public sealed class HistoryServiceOptions
     /// Default 300 (5 minutes), as per MBD PR #98 rationale.
     /// </summary>
     public int NbboStaleQuoteToleranceSeconds { get; set; } = 300;
+
+    // ── Alpaca bar fetcher (Phase 2c — stock bars route here) ────────────
+    /// <summary>
+    /// Alpaca API key (paper or live — data endpoints are independent of
+    /// the trading account). Read from <c>History__AlpacaApiKey</c>.
+    /// Stock bars route to Alpaca because Polygon's plan caps historical
+    /// 1-min bars at ~2 years; Alpaca has uncapped history on the paid
+    /// SIP feed.
+    /// </summary>
+    public string? AlpacaApiKey { get; set; }
+
+    /// <summary>Alpaca API secret. Read from <c>History__AlpacaApiSecret</c>.</summary>
+    public string? AlpacaApiSecret { get; set; }
+
+    /// <summary>
+    /// Alpaca data feed: <c>"sip"</c> (paid, full consolidated tape) or
+    /// <c>"iex"</c> (free, IEX-only). Default <c>"sip"</c> — Lisus has
+    /// the paid Alpaca subscription. Set to <c>"iex"</c> only if
+    /// downgrading.
+    /// </summary>
+    public string AlpacaDataFeed { get; set; } = "sip";
 }

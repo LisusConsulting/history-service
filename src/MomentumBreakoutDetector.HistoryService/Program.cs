@@ -6,6 +6,7 @@
 // per-call timeout live in DelegatingHandlers layered into the SDK's
 // AddPolygonClient pipeline.
 
+using Alpaca.Markets;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
@@ -123,8 +124,39 @@ builder.Services.AddGrpc(options =>
 });
 builder.Services.AddGrpcReflection();
 
-// --- Bars (micro-PR #2) ---------------------------------------------------
-builder.Services.AddSingleton<IPolygonBarFetcher, PolygonBarFetcher>();
+// --- Bars (Phase 2c — Alpaca for stocks, Polygon kept for options) -------
+// Stock bars route to Alpaca because Polygon's plan caps 1-min stock-bar
+// history at ~2 years (the original TSLA backfill hit 800 NOT_AUTHORIZED
+// misses for 2022-08-25..2025-08 dates). Alpaca's paid SIP feed has
+// uncapped history. Options stay on Polygon — Alpaca's options surface
+// (chains, NBBO) is incomplete.
+//
+// IPolygonBarFetcher is the bars-fetcher interface; the implementation
+// is now AlpacaBarFetcher. The interface name is kept for now to minimize
+// churn in HistoricalBarsProvider's signature; rename to a vendor-neutral
+// name (IHistoricalBarsFetcher) is a follow-up cleanup.
+builder.Services.AddSingleton<IAlpacaDataClient>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
+    var key = opts.AlpacaApiKey ?? string.Empty;
+    var secret = opts.AlpacaApiSecret ?? string.Empty;
+    // Alpaca data endpoints always use Environments.Live — the data feed
+    // is independent of the paper/live trading split. Empty creds yield
+    // a client that 401s on first call; the fetcher fail-quiets and
+    // surfaces a warn log.
+    var tmpSecretKey = new SecretKey(key, secret);
+    // Fully-qualified to avoid ambiguity with Microsoft.Extensions.Hosting.Environments.
+    return Alpaca.Markets.Environments.Live.GetAlpacaDataClient(tmpSecretKey);
+});
+builder.Services.AddSingleton<IPolygonBarFetcher>(sp =>
+{
+    var opts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
+    var dataClient = sp.GetRequiredService<IAlpacaDataClient>();
+    var logger = sp.GetRequiredService<ILogger<AlpacaBarFetcher>>();
+    var metrics = sp.GetRequiredService<MetricsCollector>();
+    var feed = AlpacaBarFetcher.ParseFeed(opts.AlpacaDataFeed);
+    return new AlpacaBarFetcher(dataClient, feed, logger, metrics);
+});
 builder.Services.AddScoped<IHistoricalBarsProvider, HistoricalBarsProvider>();
 
 // --- App ------------------------------------------------------------------

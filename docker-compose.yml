@@ -51,10 +51,20 @@ services:
       # for now Production gets us booting cleanly.
       ASPNETCORE_ENVIRONMENT: "Production"
       History__ConnectionString: "Host=mbd-history-postgres;Port=5432;Database=mbd_history;Username=mbd;Password=mbd"
-      # Polygon REST API key. Source from .env / shell. Fetcher fail-quiets
-      # on 401/403 so an unset key surfaces as zero-bar responses + warn
+      # Polygon REST API key. Used for OPTIONS (NBBO + chains) only.
+      # Stock bars now route to Alpaca (Phase 2c) because Polygon's plan
+      # caps 1-min stock-bar history at ~2 years. Fetcher fail-quiets on
+      # 401/403 so an unset key surfaces as zero-row responses + warn
       # logs rather than a hard crash.
       History__PolygonApiKey: ${POLYGON_API_KEY:-}
+      # Alpaca data API — stock bars (Phase 2c). Uncapped 1-min history
+      # on the paid SIP feed. Same fail-quiet contract as Polygon when
+      # unset.
+      History__AlpacaApiKey: ${ALPACA_API_KEY:-}
+      History__AlpacaApiSecret: ${ALPACA_API_SECRET:-}
+      # "sip" (paid, full consolidated tape) or "iex" (free, IEX-only).
+      # Default sip — Lisus has the paid Alpaca subscription.
+      History__AlpacaDataFeed: ${ALPACA_DATA_FEED:-sip}
       # FRED API key for the macro fetcher (FRED series observations).
       # Same fail-quiet contract as Polygon when unset.
       History__FredApiKey: ${FRED_API_KEY:-}
