@@ -37,16 +37,22 @@ CREATE TABLE IF NOT EXISTS historical_options_quotes_misses (
 CREATE INDEX IF NOT EXISTS idx_historical_options_quotes_misses_lookup
   ON historical_options_quotes_misses (ticker, range_from, range_to);
 
--- Chains: date-keyed misses (symbol, as_of_date).
+-- Chains: range-keyed misses (symbol, [range_from, range_to]).
+-- Originally point-keyed (symbol, as_of_date); migrated to range-shape in
+-- 010 so the intra-range gap-detection path can store one row per
+-- contiguous run of missing trading days (brief 2026-05-02). Fresh-volume
+-- inits create the new shape directly so 010 is a no-op on fresh DBs and
+-- only does real work on existing dev/paper volumes.
 CREATE TABLE IF NOT EXISTS historical_options_chains_misses (
   symbol      VARCHAR(10)  NOT NULL,
-  as_of_date  DATE         NOT NULL,
+  range_from  DATE         NOT NULL,
+  range_to    DATE         NOT NULL,
   reason      TEXT,
   fetched_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (symbol, as_of_date)
+  PRIMARY KEY (symbol, range_from, range_to)
 );
 CREATE INDEX IF NOT EXISTS idx_historical_options_chains_misses_lookup
-  ON historical_options_chains_misses (symbol, as_of_date);
+  ON historical_options_chains_misses (symbol, range_from, range_to);
 
 -- Macro: date-keyed misses (series_id, observation_date).
 CREATE TABLE IF NOT EXISTS macro_data_misses (

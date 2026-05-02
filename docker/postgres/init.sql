@@ -19,3 +19,7 @@
 -- never created here), but we list it so the file order stays in sync
 -- with the migrations directory and the Phase 2 deployment plan.
 \i /docker-entrypoint-initdb.d/migrations/009-nbbo-misses-range-shape.sql
+-- 010 is a no-op on fresh volumes (the v1 schema with `as_of_date` column
+-- is never created here), but we list it so the file order stays in sync
+-- with the migrations directory and the deployment plan.
+\i /docker-entrypoint-initdb.d/migrations/010-chains-misses-range-shape.sql

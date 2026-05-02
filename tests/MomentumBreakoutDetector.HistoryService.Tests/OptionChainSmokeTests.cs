@@ -58,10 +58,11 @@ public class OptionChainSmokeTests : IAsyncLifetime
 
         CREATE TABLE IF NOT EXISTS historical_options_chains_misses (
           symbol      VARCHAR(10)  NOT NULL,
-          as_of_date  DATE         NOT NULL,
+          range_from  DATE         NOT NULL,
+          range_to    DATE         NOT NULL,
           reason      TEXT,
           fetched_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-          PRIMARY KEY (symbol, as_of_date)
+          PRIMARY KEY (symbol, range_from, range_to)
         );
         """;
         await tmpCmd.ExecuteNonQueryAsync();

@@ -94,9 +94,16 @@ public static class RangeMarkerWriter
         // this could be optimised to a windowed read, but per-key marker
         // counts are bounded by the seed-window size (worst case: O(days)
         // per surface) which is well within an in-memory scan.
+        //
+        // Cast columns to TIMESTAMPTZ before binding so the helper works
+        // uniformly across TIMESTAMPTZ-typed marker tables (bars / NBBO)
+        // and DATE-typed ones (chains / macro post PR #21 / #22). Without
+        // the cast, Dapper's binder fights Npgsql's DATE → DateOnly
+        // mapping when the destination type is DateTimeOffset.
         var tmpExistingRows = (await inConn.QueryAsync<(DateTimeOffset From, DateTimeOffset To)>(
             $"""
-            SELECT {inSpec.RangeFromColumn} AS "From", {inSpec.RangeToColumn} AS "To"
+            SELECT {inSpec.RangeFromColumn}::timestamptz AS "From",
+                   {inSpec.RangeToColumn}::timestamptz   AS "To"
             FROM {inSpec.TableName}
             WHERE {tmpKeyWhere}
             """, tmpKeyParams).ConfigureAwait(false)).ToList();
@@ -136,12 +143,24 @@ public static class RangeMarkerWriter
                     ? ", @__Reason, NOW()"
                     : ", NOW()";
 
+                // Cast each parameter to the column's storage type so the
+                // helper writes uniformly into TIMESTAMPTZ-typed tables
+                // (bars / NBBO) and DATE-typed ones (chains / macro). The
+                // input is always a DateTimeOffset (UTC midnight for date-
+                // typed callers); postgres handles TIMESTAMPTZ → DATE
+                // truncation via the explicit cast.
+                var tmpRangeCast = inSpec.RangeColumnType switch
+                {
+                    RangeMarkerColumnType.Date => "::date",
+                    _ => "::timestamptz",
+                };
+
                 await inConn.ExecuteAsync(
                     $"""
                     INSERT INTO {inSpec.TableName}
                       ({tmpKeyCols}, {inSpec.RangeFromColumn}, {inSpec.RangeToColumn}{tmpExtraCols})
                     VALUES
-                      ({tmpKeyVals}, @__From, @__To{tmpExtraVals})
+                      ({tmpKeyVals}, @__From{tmpRangeCast}, @__To{tmpRangeCast}{tmpExtraVals})
                     """, tmpInsertParams, tmpTx).ConfigureAwait(false);
             }
 
@@ -196,6 +215,19 @@ public static class RangeMarkerWriter
 }
 
 /// <summary>
+/// Storage type of the <c>range_from</c> / <c>range_to</c> columns on a
+/// miss-marker table. Bars + NBBO are <see cref="Timestamptz"/>; chains +
+/// macro are <see cref="Date"/>. The writer uses this to insert with the
+/// correct postgres cast so a uniform <see cref="DateTimeOffset"/>
+/// in-memory range value lands correctly in both shapes.
+/// </summary>
+public enum RangeMarkerColumnType
+{
+    Timestamptz,
+    Date,
+}
+
+/// <summary>
 /// Schema descriptor for a range-shaped miss-marker table. Used by
 /// <see cref="RangeMarkerWriter"/> to produce SQL that's table-agnostic
 /// without resorting to an ORM. Capture column names verbatim — bars
@@ -213,4 +245,5 @@ public sealed record RangeMarkerTableSpec(
     string RangeToColumn,
     string FetchedAtColumn,
     bool HasReasonColumn,
-    string ReasonColumn);
+    string ReasonColumn,
+    RangeMarkerColumnType RangeColumnType = RangeMarkerColumnType.Timestamptz);
