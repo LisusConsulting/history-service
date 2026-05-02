@@ -1,6 +1,7 @@
 using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using MomentumBreakoutDetector.HistoryService.Concurrency;
 using Refit;
 using TreyThomasCodes.Polygon.Models.Common;
 using TreyThomasCodes.Polygon.Models.Options;
@@ -8,6 +9,14 @@ using TreyThomasCodes.Polygon.RestClient.Requests.Options;
 using TreyThomasCodes.Polygon.RestClient.Services;
 
 namespace MomentumBreakoutDetector.HistoryService.Fetchers;
+
+/// <summary>
+/// Coalescer key for <see cref="PolygonChainFetcher"/>. The public entry
+/// performs a full multi-page sweep, so the natural coalesce boundary is
+/// (symbol, asOfDate) — 50 concurrent callers collapse to ONE multi-page
+/// upstream sweep.
+/// </summary>
+internal readonly record struct ChainFetchKey(string Symbol, DateOnly AsOfDate);
 
 /// <summary>
 /// On-demand Polygon /v3/reference/options/contracts fetch. Phase E:
@@ -69,6 +78,7 @@ public sealed class PolygonChainFetcher : IPolygonChainFetcher
 {
     private readonly IOptionsService m_Options;
     private readonly ILogger<PolygonChainFetcher> m_Logger;
+    private readonly SingleFlight<ChainFetchKey, IReadOnlyList<OptionsContract>> m_Coalescer = new();
 
     /// <summary>
     /// Default per-call ceiling. Now enforced by <c>PerCallTimeoutHandler</c>
@@ -95,7 +105,23 @@ public sealed class PolygonChainFetcher : IPolygonChainFetcher
         m_Logger = inLogger;
     }
 
-    public async Task<IReadOnlyList<OptionsContract>> FetchChainAsync(
+    /// <summary>
+    /// Coalescer-wrapped public entry: 50 concurrent callers requesting
+    /// the same (symbol, asOfDate) chain collapse to ONE multi-page
+    /// upstream sweep.
+    /// </summary>
+    public Task<IReadOnlyList<OptionsContract>> FetchChainAsync(
+        string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
+    {
+        var tmpKey = new ChainFetchKey(inSymbol, inAsOfDate);
+        return m_Coalescer.ExecuteAsync(tmpKey,
+            () => FetchChainAsync_Inner(inSymbol, inAsOfDate, inCt));
+    }
+
+    /// <summary>Diagnostic: in-flight coalescer entries.</summary>
+    internal int InFlightCount => m_Coalescer.InFlightCount;
+
+    private async Task<IReadOnlyList<OptionsContract>> FetchChainAsync_Inner(
         string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
     {
         if (string.IsNullOrEmpty(inSymbol)) return Array.Empty<OptionsContract>();

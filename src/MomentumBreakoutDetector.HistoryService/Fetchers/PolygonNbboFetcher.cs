@@ -1,10 +1,17 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using MomentumBreakoutDetector.HistoryService.Concurrency;
 using TreyThomasCodes.Polygon.RestClient.Exceptions;
 using TreyThomasCodes.Polygon.RestClient.Requests.Options;
 using TreyThomasCodes.Polygon.RestClient.Services;
 
 namespace MomentumBreakoutDetector.HistoryService.Fetchers;
+
+/// <summary>
+/// Coalescer key for <see cref="PolygonNbboFetcher"/>: same (ticker,
+/// timestamp) → single upstream /v3/quotes call.
+/// </summary>
+internal readonly record struct NbboFetchKey(string Ticker, DateTime Ts);
 
 /// <summary>
 /// On-demand Polygon /v3/quotes NBBO fetch. Phase E: refactored from raw
@@ -40,6 +47,7 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
 
     private readonly IOptionsService m_Options;
     private readonly ILogger<PolygonNbboFetcher> m_Logger;
+    private readonly SingleFlight<NbboFetchKey, PolygonNbboFetch> m_Coalescer = new();
 
     public PolygonNbboFetcher(
         IOptionsService inOptions,
@@ -63,10 +71,27 @@ public sealed class PolygonNbboFetcher : IPolygonNbboFetcher
     {
     }
 
-    public async Task<PolygonNbboFetch> FetchAsync(
+    /// <summary>
+    /// Coalescer-wrapped public entry: 100 concurrent callers asking for
+    /// the same (ticker, ts) collapse to one upstream /v3/quotes call.
+    /// </summary>
+    public Task<PolygonNbboFetch> FetchAsync(
         string inTicker,
         DateTime inTsUtc,
         CancellationToken inCt = default)
+    {
+        var tmpKey = new NbboFetchKey(inTicker, inTsUtc);
+        return m_Coalescer.ExecuteAsync(tmpKey,
+            () => FetchAsync_Inner(inTicker, inTsUtc, inCt));
+    }
+
+    /// <summary>Diagnostic: in-flight coalescer entries.</summary>
+    internal int InFlightCount => m_Coalescer.InFlightCount;
+
+    private async Task<PolygonNbboFetch> FetchAsync_Inner(
+        string inTicker,
+        DateTime inTsUtc,
+        CancellationToken inCt)
     {
         // Polygon accepts ISO-8601 with seconds, in UTC. e.g.
         // "2025-12-15T15:30:00Z". timestamp.lte + order=desc + limit=1

@@ -1,8 +1,15 @@
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
+using MomentumBreakoutDetector.HistoryService.Concurrency;
 
 namespace MomentumBreakoutDetector.HistoryService.Fetchers;
+
+/// <summary>
+/// Coalescer key for <see cref="FredFetcher"/>: same (seriesId, fromDate,
+/// toDate) → single upstream FRED /fred/series/observations call.
+/// </summary>
+internal readonly record struct MacroFetchKey(string SeriesId, DateOnly FromDate, DateOnly ToDate);
 
 /// <summary>
 /// Single FRED observation row mapped from the
@@ -55,6 +62,7 @@ public sealed class FredFetcher : IFredFetcher
     private readonly SemaphoreSlim _fetchConcurrencyGate;
     private readonly int _perCallTimeoutMs;
     private readonly string? _apiKey;
+    private readonly SingleFlight<MacroFetchKey, IReadOnlyList<FredObservationRow>> _coalescer = new();
 
     /// <summary>
     /// Default per-call ceiling on a single FRED <c>/fred/series/observations</c>
@@ -89,7 +97,24 @@ public sealed class FredFetcher : IFredFetcher
         _fetchConcurrencyGate = new SemaphoreSlim(maxCc, maxCc);
     }
 
-    public async Task<IReadOnlyList<FredObservationRow>> FetchSeriesAsync(
+    /// <summary>
+    /// Coalescer-wrapped public entry: N concurrent callers asking for
+    /// the same (seriesId, fromDate, toDate) collapse to ONE upstream
+    /// FRED call.
+    /// </summary>
+    public Task<IReadOnlyList<FredObservationRow>> FetchSeriesAsync(
+        string seriesId, DateOnly fromDate, DateOnly toDate,
+        CancellationToken ct)
+    {
+        var key = new MacroFetchKey(seriesId, fromDate, toDate);
+        return _coalescer.ExecuteAsync(key,
+            () => FetchSeriesAsync_Inner(seriesId, fromDate, toDate, ct));
+    }
+
+    /// <summary>Diagnostic: in-flight coalescer entries.</summary>
+    internal int InFlightCount => _coalescer.InFlightCount;
+
+    private async Task<IReadOnlyList<FredObservationRow>> FetchSeriesAsync_Inner(
         string seriesId, DateOnly fromDate, DateOnly toDate,
         CancellationToken ct)
     {
