@@ -289,7 +289,10 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
         var tmpMetrics = new MetricsCollector();
         var tmpHarness = BuildHarness(tmpMetrics, fetchOutcome: FetchOutcome.NotFound);
 
-        var tmpFromTs = new DateTime(2026, 4, 18, 13, 30, 0, DateTimeKind.Utc);
+        // Friday, real trading day. The new gap-detector consults
+        // TradingCalendar; Saturday/Sunday windows yield empty
+        // expected-set and would short-circuit before any fetch.
+        var tmpFromTs = new DateTime(2026, 4, 17, 13, 30, 0, DateTimeKind.Utc);
         var tmpToTs = tmpFromTs.AddMinutes(4);
 
         var tmpReq = new GetBarsRequest
@@ -331,7 +334,10 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
         var tmpMetrics = new MetricsCollector();
         var tmpHarness = BuildHarness(tmpMetrics);
 
-        var tmpFromTs = new DateTime(2026, 4, 19, 13, 30, 0, DateTimeKind.Utc);
+        // Friday — real trading day. New gap detector requires the date
+        // to be in the trading calendar; previously this test used Sunday
+        // Apr 19 which the cache-edge logic treated as a normal range.
+        var tmpFromTs = new DateTime(2026, 4, 17, 13, 30, 0, DateTimeKind.Utc);
         var tmpToTs = tmpFromTs.AddMinutes(4);
         var tmpReq = new GetBarsRequest
         {

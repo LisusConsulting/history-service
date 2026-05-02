@@ -5,6 +5,8 @@ using MomentumBreakoutDetector.HistoryService.Domain;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
 using MomentumBreakoutDetector.HistoryService.Observability;
 using Npgsql;
+using TradingCalendar = MomentumBreakoutDetector.HistoryService.Domain.TradingCalendar;
+using TradingSession = MomentumBreakoutDetector.HistoryService.Domain.TradingSession;
 
 namespace MomentumBreakoutDetector.HistoryService.Providers;
 
@@ -221,21 +223,56 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
 
     /// <summary>
     /// Identify gaps in the cache for the requested range, fetch them
-    /// from Polygon, upsert into historical_bars, record miss markers
-    /// for empty returns. Cold-start (empty DB) collapses to a single
-    /// full-range fetch; warm cache short-circuits.
+    /// from Polygon, upsert into historical_bars, record range-shaped
+    /// miss markers for empty returns. Cold-start (empty DB) collapses
+    /// to a single full-range fetch; warm cache short-circuits.
     ///
-    /// Gap-detection strategy (cache-edge based, not market-calendar):
-    ///   - Read MIN/MAX of cached bar timestamps in range.
-    ///   - Read miss markers in range.
-    ///   - Compute "uncovered" sub-ranges: [from, minCached - 1bar],
-    ///     [maxCached + 1bar, to], minus any range covered by an
-    ///     existing marker.
-    ///   - Chunk each uncovered range to ≤ MaxFetchChunkDays days.
-    ///   - Issue one Polygon call per chunk.
-    ///
-    /// Returns the total upstream call count so the caller (GetBarsAsync)
-    /// can populate the cache_hit flag without a second probe.
+    /// <para>
+    /// <b>Gap-detection strategy (post-2026-05-02 — was cache-edge based,
+    /// now expected-minus-cached-minus-marked):</b>
+    /// <list type="number">
+    ///   <item>
+    ///     <c>expected</c> = the minute-set the cache should cover for
+    ///     <paramref name="inSymbol"/> over [<paramref name="inFromUtc"/>,
+    ///     <paramref name="inToUtc"/>] given <paramref name="inTimeframe"/>.
+    ///     Built from <see cref="TradingCalendar.GetSessionMinutes"/>
+    ///     iterated over each trading day in range, intersected with the
+    ///     request window. For 1-min/5-min/15-min/1h timeframes this is the
+    ///     full ExtendedHours session (04:00→20:00 ET, the window Alpaca
+    ///     and Polygon both serve). For 1day this is just one timestamp
+    ///     per trading day at 04:00 UTC (00:00 ET).
+    ///   </item>
+    ///   <item>
+    ///     <c>cached</c> = SELECT timestamp FROM historical_bars WHERE
+    ///     (symbol, timeframe) AND timestamp ∈ [from, to].
+    ///   </item>
+    ///   <item>
+    ///     <c>marked</c> = the existing range-shaped marker rows for
+    ///     (symbol, timeframe) overlapping [from, to].
+    ///   </item>
+    ///   <item>
+    ///     <c>to_fetch</c> = (expected − cached) − marked, then coalesce
+    ///     contiguous slots into ranges (a whole missing afternoon → ONE
+    ///     range, not 195 minute-points).
+    ///   </item>
+    ///   <item>
+    ///     For each contiguous to-fetch range: chunk into ≤
+    ///     <see cref="MaxFetchChunkDays"/>-day sub-ranges, fetch, upsert.
+    ///     If the chunk returns empty, defer the marker writes until end
+    ///     of run, then coalesce-on-write via <see cref="RangeMarkerWriter"/>
+    ///     so adjacent markers merge with each other AND with any
+    ///     pre-existing marker rows.
+    ///   </item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Why this beats cache-edge: a 30-minute trading halt mid-session
+    /// inside a fully-cached day is invisible to the edge logic (cache
+    /// MIN/MAX still spans the day) but surfaces here as a 30-minute
+    /// to_fetch range. The new pass also self-heals if markers are
+    /// truncated — re-runs reconstruct them from the expected-minus-cached
+    /// math.
+    /// </para>
     /// </summary>
     /// <returns>Number of upstream Polygon calls issued (0 = cache hit).</returns>
     public async Task<int> EnsureRangeCachedAsync(
@@ -252,41 +289,35 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
         await using var tmpConn = new NpgsqlConnection(m_ConnectionString);
         await tmpConn.OpenAsync(inCt);
 
-        // Cache edges
-        var tmpEdges = await tmpConn.QueryFirstOrDefaultAsync<EdgeRow>(
+        // 1. Build expected timestamp set per trading-calendar.
+        var tmpExpected = ComputeExpectedTimestamps(inFromUtc, inToUtc, inTimeframe);
+        if (tmpExpected.Count == 0)
+        {
+            // No trading days / minutes in window — nothing to fetch.
+            m_Logger.LogDebug(
+                "No expected timestamps for {Symbol} {Timeframe} {From:O}..{To:O} (weekend / all-holiday) — skip",
+                inSymbol, inTimeframe, inFromUtc, inToUtc);
+            return 0;
+        }
+
+        // 2. Pull cached timestamps for the window. We ask postgres for
+        // the exact timestamps (rather than just MIN/MAX) so we can
+        // diff against the expected set. The (symbol, timeframe,
+        // timestamp) unique index makes this cheap; for a full year of
+        // 1-min bars at ExtendedHours cadence that's ~240k rows per
+        // symbol (manageable in-memory).
+        var tmpCachedRows = (await tmpConn.QueryAsync<DateTime>(
             """
-            SELECT MIN(timestamp) AS Earliest, MAX(timestamp) AS Latest, COUNT(*) AS Total
+            SELECT timestamp
             FROM historical_bars
             WHERE symbol = @Symbol AND timeframe = @Timeframe
               AND timestamp >= @From AND timestamp <= @To
             """,
-            new { Symbol = inSymbol, Timeframe = tmpTimeframeStr, From = inFromUtc, To = inToUtc });
+            new { Symbol = inSymbol, Timeframe = tmpTimeframeStr, From = inFromUtc, To = inToUtc })).ToList();
+        var tmpCached = new HashSet<DateTime>(tmpCachedRows.Select(t =>
+            DateTime.SpecifyKind(t, DateTimeKind.Utc)));
 
-        var tmpHaveCached = (tmpEdges?.Total ?? 0) > 0;
-
-        // Determine uncovered sub-ranges (edge-gap detection).
-        var tmpUncovered = new List<(DateTime From, DateTime To)>();
-        if (!tmpHaveCached)
-        {
-            tmpUncovered.Add((inFromUtc, inToUtc));
-        }
-        else
-        {
-            if (inFromUtc < tmpEdges!.Earliest!.Value)
-                tmpUncovered.Add((inFromUtc, tmpEdges.Earliest.Value - tmpStep));
-            if (tmpEdges.Latest!.Value < inToUtc)
-                tmpUncovered.Add((tmpEdges.Latest.Value + tmpStep, inToUtc));
-        }
-
-        if (tmpUncovered.Count == 0)
-        {
-            m_Logger.LogDebug(
-                "Cache fully covers {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd} ({Total} bars) — no on-demand fetch",
-                inSymbol, inTimeframe, inFromUtc, inToUtc, tmpEdges!.Total);
-            return 0;
-        }
-
-        // Subtract miss markers — sub-ranges already known unfetchable.
+        // 3. Pull existing range markers.
         var tmpMarkerRows = (await tmpConn.QueryAsync<MissRow>(
             """
             SELECT range_from AS RangeFrom, range_to AS RangeTo
@@ -296,20 +327,47 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
             """,
             new { Symbol = inSymbol, Timeframe = tmpTimeframeStr, From = inFromUtc, To = inToUtc })).ToList();
 
-        var tmpToFetch = SubtractMarkers(tmpUncovered, tmpMarkerRows);
-
-        if (tmpToFetch.Count == 0)
+        // 4. expected − cached − marked. Iterate expected once, drop any
+        // ts that's cached OR shadowed by a marker, collect the survivors.
+        var tmpMissing = new List<DateTime>(tmpExpected.Count);
+        foreach (var tmpTs in tmpExpected)
         {
-            m_Logger.LogInformation(
-                "All uncovered sub-ranges for {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd} are marker-shadowed — no Polygon fetch needed",
-                inSymbol, inTimeframe, inFromUtc, inToUtc);
+            if (tmpCached.Contains(tmpTs)) continue;
+            var tmpShadowed = false;
+            foreach (var tmpMarker in tmpMarkerRows)
+            {
+                if (tmpTs >= tmpMarker.RangeFrom && tmpTs <= tmpMarker.RangeTo)
+                {
+                    tmpShadowed = true;
+                    break;
+                }
+            }
+            if (!tmpShadowed) tmpMissing.Add(tmpTs);
+        }
+
+        if (tmpMissing.Count == 0)
+        {
+            m_Logger.LogDebug(
+                "Cache fully covers {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd} (expected={Expected}, cached={Cached}, marked={Markers}) — no on-demand fetch",
+                inSymbol, inTimeframe, inFromUtc, inToUtc,
+                tmpExpected.Count, tmpCached.Count, tmpMarkerRows.Count);
             return 0;
         }
 
-        // Materialize chunks up front so we know the total count for
-        // progress reporting. Each chunk maps 1:1 to a Polygon call.
+        // 5. Coalesce contiguous missing timestamps into ranges. Two
+        // points are contiguous iff they differ by exactly tmpStep ticks.
+        var tmpToFetchRanges = CoalesceContiguous(tmpMissing, tmpStep);
+        m_Logger.LogInformation(
+            "Bars gap detected for {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd}: {Missing} missing timestamps in {Ranges} contiguous ranges (expected={Expected}, cached={Cached}, marked={Markers})",
+            inSymbol, inTimeframe, inFromUtc, inToUtc,
+            tmpMissing.Count, tmpToFetchRanges.Count,
+            tmpExpected.Count, tmpCached.Count, tmpMarkerRows.Count);
+
+        // 6. Chunk + fetch + upsert. Empty-fetch results queue up for
+        // post-loop coalesce-on-write so we don't fragment the marker
+        // table with one row per chunk.
         var tmpChunks = new List<(DateTime From, DateTime To)>();
-        foreach (var tmpRange in tmpToFetch)
+        foreach (var tmpRange in tmpToFetchRanges)
         {
             foreach (var tmpChunk in ChunkRange(tmpRange.From, tmpRange.To, MaxFetchChunkDays))
             {
@@ -317,8 +375,8 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
             }
         }
 
-        // Chunk + fetch + upsert + marker.
-        int tmpUpstreamCalls = 0;
+        var tmpUpstreamCalls = 0;
+        var tmpEmptyChunks = new List<(DateTime From, DateTime To)>();
         for (var tmpIdx = 0; tmpIdx < tmpChunks.Count; tmpIdx++)
         {
             var (tmpChunkFrom, tmpChunkTo) = tmpChunks[tmpIdx];
@@ -328,12 +386,7 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
 
             if (tmpFetched.Count == 0)
             {
-                // Empty → write a miss marker so subsequent runs skip
-                // the re-fetch (4xx, plan-tier limit, weekend/holiday,
-                // contract not yet listed).
-                await RecordBarMissAsync(
-                    tmpConn, inSymbol, tmpTimeframeStr, tmpChunkFrom, tmpChunkTo,
-                    "no-data-from-polygon", inCt);
+                tmpEmptyChunks.Add((tmpChunkFrom, tmpChunkTo));
                 if (inProgress is not null)
                 {
                     await inProgress(new BarsWarmupProgress(
@@ -351,8 +404,181 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
                     BarsFetched: tmpFetched.Count, IsMissChunk: false), inCt);
             }
         }
+
+        // 7. After fetching: any chunk whose response was empty AND whose
+        // missing-timestamps subset of `expected` is still missing → the
+        // chunk maps 1:1 to a range marker. We compute the marker ranges
+        // by re-coalescing the missing timestamps that fell inside any
+        // empty chunk and intersecting with that chunk. RangeMarkerWriter
+        // then merges with adjacent existing markers.
+        if (tmpEmptyChunks.Count > 0)
+        {
+            await PersistEmptyChunkMarkersAsync(
+                tmpConn, inSymbol, tmpTimeframeStr,
+                tmpEmptyChunks, tmpMissing, tmpStep, inCt);
+        }
+
         return tmpUpstreamCalls;
     }
+
+    /// <summary>
+    /// Build the full set of UTC-typed bar-open timestamps the cache is
+    /// expected to contain over [from, to] for a given timeframe. RTH-bar
+    /// timeframes use the ExtendedHours session (04:00→20:00 ET) which
+    /// is what Alpaca and Polygon both return; 1day yields one timestamp
+    /// per trading-day at 04:00 UTC (= 00:00 ET) matching the cached
+    /// shape. Internal so unit tests can pin the math without standing
+    /// up a Postgres container.
+    /// </summary>
+    internal static List<DateTime> ComputeExpectedTimestamps(
+        DateTime inFromUtc, DateTime inToUtc, BarTimeframe inTimeframe)
+    {
+        var tmpFromDate = DateOnly.FromDateTime(inFromUtc);
+        var tmpToDate = DateOnly.FromDateTime(inToUtc);
+        var tmpResult = new List<DateTime>();
+
+        if (inTimeframe == BarTimeframe.OneDay)
+        {
+            // Daily bars are stored at 04:00 UTC for each trading day
+            // (MIDNIGHT_ET → UTC during EST is 05:00 UTC; during EDT is
+            // 04:00 UTC; cached shape uses 04:00 consistently per the
+            // current bars table). Yield one timestamp per trading day
+            // matching the stored convention.
+            foreach (var tmpDay in TradingCalendar.EnumerateTradingDays(tmpFromDate, tmpToDate))
+            {
+                // Use 04:00 UTC as the daily bar boundary — that's what
+                // the cached rows use today. If this convention changes
+                // in the future the test suite will catch it.
+                var tmpTs = new DateTime(tmpDay.Year, tmpDay.Month, tmpDay.Day, 4, 0, 0, DateTimeKind.Utc);
+                if (tmpTs >= inFromUtc && tmpTs <= inToUtc) tmpResult.Add(tmpTs);
+            }
+            return tmpResult;
+        }
+
+        var tmpStep = StepForTimeframe(inTimeframe);
+        foreach (var tmpDay in TradingCalendar.EnumerateTradingDays(tmpFromDate, tmpToDate))
+        {
+            // Intra-day bars cover ExtendedHours. Filter the minute set to
+            // the requested timeframe stride so 5-min only yields :00, :05
+            // …, 15-min only yields :00, :15, :30, :45 etc.
+            foreach (var tmpMinute in TradingCalendar.GetSessionMinutes(tmpDay, TradingSession.ExtendedHours))
+            {
+                if (tmpMinute < inFromUtc || tmpMinute > inToUtc) continue;
+                if (tmpStep.TotalMinutes > 1)
+                {
+                    // Align to bar-open: minute % stride == 0 from a
+                    // session-anchored origin. ExtendedHours starts at
+                    // 04:00 ET; modulo from start-of-day-UTC is fine
+                    // because all valid stride values divide the hour.
+                    if (tmpMinute.Minute % tmpStep.TotalMinutes != 0) continue;
+                    if (inTimeframe == BarTimeframe.OneHour && tmpMinute.Minute != 0) continue;
+                }
+                tmpResult.Add(tmpMinute);
+            }
+        }
+        return tmpResult;
+    }
+
+    /// <summary>
+    /// Coalesce a sorted-or-unsorted set of timestamps into the minimal
+    /// set of contiguous ranges where two adjacent timestamps differ by
+    /// exactly <paramref name="inStep"/>. Internal so unit tests can pin
+    /// the math directly.
+    /// </summary>
+    internal static List<(DateTime From, DateTime To)> CoalesceContiguous(
+        IEnumerable<DateTime> inTimestamps, TimeSpan inStep)
+    {
+        var tmpSorted = inTimestamps.OrderBy(t => t).ToList();
+        if (tmpSorted.Count == 0) return new List<(DateTime, DateTime)>();
+
+        var tmpResult = new List<(DateTime From, DateTime To)>();
+        var tmpRangeStart = tmpSorted[0];
+        var tmpRangeEnd = tmpSorted[0];
+        for (var i = 1; i < tmpSorted.Count; i++)
+        {
+            var tmpTs = tmpSorted[i];
+            if (tmpTs - tmpRangeEnd <= inStep)
+            {
+                tmpRangeEnd = tmpTs;
+            }
+            else
+            {
+                tmpResult.Add((tmpRangeStart, tmpRangeEnd));
+                tmpRangeStart = tmpTs;
+                tmpRangeEnd = tmpTs;
+            }
+        }
+        tmpResult.Add((tmpRangeStart, tmpRangeEnd));
+        return tmpResult;
+    }
+
+    /// <summary>
+    /// After the fetch loop, persist range markers for the contiguous
+    /// runs of missing timestamps that fell inside an empty-response
+    /// chunk. Coalesce-on-write merges adjacent existing markers so the
+    /// table doesn't fragment over re-runs.
+    /// </summary>
+    private async Task PersistEmptyChunkMarkersAsync(
+        NpgsqlConnection inConn, string inSymbol, string inTimeframe,
+        IReadOnlyList<(DateTime From, DateTime To)> inEmptyChunks,
+        IReadOnlyList<DateTime> inMissingTimestamps,
+        TimeSpan inStep,
+        CancellationToken inCt)
+    {
+        // Filter the originally-missing timestamps to those inside any
+        // empty chunk (Polygon returned no bars for that whole chunk),
+        // re-coalesce, and write as range markers via RangeMarkerWriter.
+        var tmpInsideEmpty = new List<DateTime>();
+        foreach (var tmpTs in inMissingTimestamps)
+        {
+            foreach (var tmpChunk in inEmptyChunks)
+            {
+                if (tmpTs >= tmpChunk.From && tmpTs <= tmpChunk.To)
+                {
+                    tmpInsideEmpty.Add(tmpTs);
+                    break;
+                }
+            }
+        }
+        if (tmpInsideEmpty.Count == 0) return;
+
+        var tmpRanges = CoalesceContiguous(tmpInsideEmpty, inStep);
+        var tmpRangesUtc = tmpRanges
+            .Select(r => (
+                From: new DateTimeOffset(DateTime.SpecifyKind(r.From, DateTimeKind.Utc)),
+                To: new DateTimeOffset(DateTime.SpecifyKind(r.To, DateTimeKind.Utc))))
+            .ToList<(DateTimeOffset From, DateTimeOffset To)>();
+
+        var tmpKeyValues = new[]
+        {
+            new KeyValuePair<string, object>("Symbol", inSymbol),
+            new KeyValuePair<string, object>("Timeframe", inTimeframe),
+        };
+
+        var tmpFinalCount = await RangeMarkerWriter.WriteAsync(
+            inConn, BarsMissTableSpec, tmpKeyValues,
+            tmpRangesUtc, "no-data-from-polygon",
+            inAdjacencyTicks: inStep.Ticks,
+            inCt: inCt).ConfigureAwait(false);
+
+        m_Metrics?.RecordMissMarker(MetricKind.Bars);
+        m_Logger.LogInformation(
+            "Recorded {Ranges} bar miss-marker range(s) for {Symbol} {Timeframe} (table now has {Total} rows for this key)",
+            tmpRanges.Count, inSymbol, inTimeframe, tmpFinalCount);
+    }
+
+    /// <summary>
+    /// Schema descriptor for <c>historical_bars_misses</c> — bound at
+    /// class scope so it's reusable + so tests can refer to it.
+    /// </summary>
+    internal static readonly RangeMarkerTableSpec BarsMissTableSpec = new(
+        TableName: "historical_bars_misses",
+        KeyColumns: new[] { "symbol", "timeframe" },
+        RangeFromColumn: "range_from",
+        RangeToColumn: "range_to",
+        FetchedAtColumn: "fetched_at",
+        HasReasonColumn: true,
+        ReasonColumn: "reason");
 
     /// <summary>
     /// Per-bar step used to compute exclusive boundaries when slicing
@@ -367,44 +593,6 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
         BarTimeframe.OneDay => TimeSpan.FromDays(1),
         _ => TimeSpan.FromMinutes(1)
     };
-
-    /// <summary>
-    /// Subtract miss-marker ranges from the uncovered range list.
-    /// Internal so unit tests can pin the math directly.
-    /// </summary>
-    internal static List<(DateTime From, DateTime To)> SubtractMarkers(
-        IReadOnlyList<(DateTime From, DateTime To)> inUncovered,
-        IReadOnlyList<MissRow> inMarkers)
-    {
-        if (inMarkers.Count == 0) return inUncovered.ToList();
-
-        var tmpResult = new List<(DateTime From, DateTime To)>();
-        foreach (var tmpRange in inUncovered)
-        {
-            var tmpFragments = new List<(DateTime From, DateTime To)> { tmpRange };
-            foreach (var tmpMarker in inMarkers)
-            {
-                var tmpNext = new List<(DateTime From, DateTime To)>();
-                foreach (var tmpFrag in tmpFragments)
-                {
-                    if (tmpMarker.RangeTo < tmpFrag.From || tmpMarker.RangeFrom > tmpFrag.To)
-                    {
-                        tmpNext.Add(tmpFrag);
-                        continue;
-                    }
-                    if (tmpMarker.RangeFrom <= tmpFrag.From && tmpMarker.RangeTo >= tmpFrag.To)
-                        continue;
-                    if (tmpMarker.RangeFrom > tmpFrag.From)
-                        tmpNext.Add((tmpFrag.From, tmpMarker.RangeFrom.AddTicks(-1)));
-                    if (tmpMarker.RangeTo < tmpFrag.To)
-                        tmpNext.Add((tmpMarker.RangeTo.AddTicks(1), tmpFrag.To));
-                }
-                tmpFragments = tmpNext;
-            }
-            tmpResult.AddRange(tmpFragments);
-        }
-        return tmpResult;
-    }
 
     /// <summary>
     /// Chunk a [from, to] range into successive sub-ranges no longer
@@ -465,27 +653,9 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
             inBars.Count, inTimeframe, inSymbol);
     }
 
-    private async Task RecordBarMissAsync(
-        NpgsqlConnection inConn, string inSymbol, string inTimeframe,
-        DateTime inFromUtc, DateTime inToUtc, string inReason, CancellationToken inCt)
-    {
-        await inConn.ExecuteAsync(
-            """
-            INSERT INTO historical_bars_misses (symbol, timeframe, range_from, range_to, reason, fetched_at)
-            VALUES (@Symbol, @Timeframe, @From, @To, @Reason, NOW())
-            ON CONFLICT (symbol, timeframe, range_from, range_to) DO NOTHING
-            """,
-            new { Symbol = inSymbol, Timeframe = inTimeframe, From = inFromUtc, To = inToUtc, Reason = inReason });
-        m_Metrics?.RecordMissMarker(MetricKind.Bars);
-        m_Logger.LogInformation(
-            "Recorded bar miss-marker {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd} ({Reason})",
-            inSymbol, inTimeframe, inFromUtc, inToUtc, inReason);
-    }
-
-    /// <summary>Internal record exposed for unit tests of <see cref="SubtractMarkers"/>.</summary>
+    /// <summary>Internal Dapper-mapping row for the marker-shadow read in
+    /// EnsureRangeCachedAsync.</summary>
     internal sealed record MissRow(DateTime RangeFrom, DateTime RangeTo);
-
-    private sealed record EdgeRow(DateTime? Earliest, DateTime? Latest, long Total);
 
     private static string MapTimeframe(BarTimeframe inTimeframe) => inTimeframe switch
     {
