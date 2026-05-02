@@ -419,6 +419,98 @@ public sealed class PastOnlyRangeValidationTests
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // EnsureRangeCached (server-streaming RPC).
+    //
+    // The validator must fire BEFORE any stream write. An invalid range
+    // must throw FAILED_PRECONDITION immediately and leave the capturing
+    // stream empty (zero progress messages).
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task EnsureRangeCached_RangeEndingAtBoundary_IsRejected_WithZeroProgressEmitted()
+    {
+        // to == boundary → includes today's first instant → rejected.
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(-1);
+        var tmpToUtc = tmpBoundary;
+
+        var tmpImpl = NewImplWith(new ThrowingBarsProvider());
+        var tmpRequest = new EnsureRangeCachedRequest
+        {
+            FromTs = Timestamp.FromDateTime(DateTime.SpecifyKind(tmpFromUtc, DateTimeKind.Utc)),
+            ToTs = Timestamp.FromDateTime(DateTime.SpecifyKind(tmpToUtc, DateTimeKind.Utc)),
+        };
+        tmpRequest.Symbols.Add("TSLA");
+        tmpRequest.DataClasses.Add(DataClass.Bars);
+
+        var tmpStream = new CapturingStreamWriter<EnsureRangeCachedProgress>();
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.EnsureRangeCached(tmpRequest, tmpStream, NewServerCallContext()));
+
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpEx.Status.Detail.ShouldContain("past-day data only");
+        tmpEx.Status.Detail.ShouldContain("ET");
+        // The validator fires before any stream write — no progress at all.
+        tmpStream.Captured.Count.ShouldBe(0,
+            "no progress messages should be emitted before the validator rejects the range");
+    }
+
+    [Fact]
+    public async Task EnsureRangeCached_RangeEntirelyInFuture_IsRejected_WithZeroProgressEmitted()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(1);
+        var tmpToUtc = tmpBoundary.AddDays(7);
+
+        var tmpImpl = NewImplWith(new ThrowingBarsProvider());
+        var tmpRequest = new EnsureRangeCachedRequest
+        {
+            FromTs = Timestamp.FromDateTime(DateTime.SpecifyKind(tmpFromUtc, DateTimeKind.Utc)),
+            ToTs = Timestamp.FromDateTime(DateTime.SpecifyKind(tmpToUtc, DateTimeKind.Utc)),
+        };
+        tmpRequest.Symbols.Add("TSLA");
+        tmpRequest.DataClasses.Add(DataClass.Bars);
+
+        var tmpStream = new CapturingStreamWriter<EnsureRangeCachedProgress>();
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.EnsureRangeCached(tmpRequest, tmpStream, NewServerCallContext()));
+
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpStream.Captured.Count.ShouldBe(0);
+    }
+
+    [Fact]
+    public async Task EnsureRangeCached_StraddlingRange_IsRejected_WithZeroProgressEmitted()
+    {
+        // from in the past, to in the future. No partial execution.
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(-1);
+        var tmpToUtc = tmpBoundary.AddHours(2);
+
+        var tmpProvider = new ThrowingBarsProvider();
+        var tmpImpl = NewImplWith(tmpProvider);
+        var tmpRequest = new EnsureRangeCachedRequest
+        {
+            FromTs = Timestamp.FromDateTime(DateTime.SpecifyKind(tmpFromUtc, DateTimeKind.Utc)),
+            ToTs = Timestamp.FromDateTime(DateTime.SpecifyKind(tmpToUtc, DateTimeKind.Utc)),
+        };
+        tmpRequest.Symbols.Add("TSLA");
+        tmpRequest.DataClasses.Add(DataClass.Bars);
+
+        var tmpStream = new CapturingStreamWriter<EnsureRangeCachedProgress>();
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.EnsureRangeCached(tmpRequest, tmpStream, NewServerCallContext()));
+
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        // Validator fires before any provider touch.
+        tmpProvider.WasInvoked.ShouldBeFalse();
+        tmpStream.Captured.Count.ShouldBe(0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // Wiring helpers + stub providers.
     // ─────────────────────────────────────────────────────────────────
 
@@ -573,6 +665,22 @@ public sealed class PastOnlyRangeValidationTests
         {
             WasInvoked = true;
             throw new InvalidOperationException("Macro provider must not be invoked when validation rejects.");
+        }
+    }
+
+    /// <summary>
+    /// Captures every message written to the stream. Used by the
+    /// EnsureRangeCached tests to assert that zero progress messages are
+    /// emitted before a FAILED_PRECONDITION rejection.
+    /// </summary>
+    private sealed class CapturingStreamWriter<T> : IServerStreamWriter<T>
+    {
+        public List<T> Captured { get; } = new();
+        public WriteOptions? WriteOptions { get; set; }
+        public Task WriteAsync(T message)
+        {
+            Captured.Add(message);
+            return Task.CompletedTask;
         }
     }
 }
