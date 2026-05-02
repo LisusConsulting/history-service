@@ -70,11 +70,17 @@ public class MacroSmokeTests : IAsyncLifetime
         rows.ShouldContain(r => r.ObservationDate == new DateOnly(2024, 4, 29) && r.Value == -0.34m);
         rows.ShouldNotContain(r => r.ObservationDate == new DateOnly(2024, 5, 2));
 
-        // Verify the null-value date got a miss-marker so the cache view is complete.
+        // Verify the null-value date got a range marker covering it so
+        // the cache view is complete. Range-shape post PR #22:
+        // historical_options_quotes_misses → range_from / range_to.
         await using var conn = new NpgsqlConnection(_pg.GetConnectionString());
         await conn.OpenAsync();
         await using var cmd = new NpgsqlCommand(
-            "SELECT COUNT(*) FROM macro_data_misses WHERE series_id = @sid AND observation_date = @d",
+            """
+            SELECT COUNT(*) FROM macro_data_misses
+            WHERE series_id = @sid
+              AND range_from <= @d::date AND range_to >= @d::date
+            """,
             conn);
         cmd.Parameters.AddWithValue("sid", "T10Y2Y");
         cmd.Parameters.AddWithValue("d", new DateTime(2024, 5, 2));
@@ -99,11 +105,12 @@ public class MacroSmokeTests : IAsyncLifetime
               ON macro_data (series_id, observation_date);
 
             CREATE TABLE IF NOT EXISTS macro_data_misses (
-              series_id        VARCHAR(20)  NOT NULL,
-              observation_date DATE         NOT NULL,
-              reason           TEXT,
-              fetched_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-              PRIMARY KEY (series_id, observation_date)
+              series_id   VARCHAR(20)  NOT NULL,
+              range_from  DATE         NOT NULL,
+              range_to    DATE         NOT NULL,
+              reason      TEXT,
+              fetched_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (series_id, range_from, range_to)
             );
             """;
         await using var conn = new NpgsqlConnection(_pg.GetConnectionString());

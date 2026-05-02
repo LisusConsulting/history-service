@@ -41,8 +41,8 @@ public interface IMacroDataProvider
 /// <summary>
 /// Lifted from MBD's PostgresMacroDataProvider (PR D, 2026-04-30). Reads
 /// <c>macro_data</c> from PostgreSQL with on-demand FRED fetch when the
-/// cached range is incomplete. Edge-only gap detection, idempotent
-/// upsert, miss-marker table for permanently-unavailable observations.
+/// cached range is incomplete. Idempotent upsert; range-shape miss-marker
+/// table for permanently-unavailable observations.
 ///
 /// <para>
 /// Cadence-aware gap detection: T10Y2Y publishes Mon-Fri (skipping
@@ -51,6 +51,21 @@ public interface IMacroDataProvider
 /// monthly series. The cadence map below tells the gap detector how
 /// many points it should expect in a given window — short of that,
 /// fetch the missing range from FRED.
+/// </para>
+///
+/// <para>
+/// <b>Range markers (post 2026-05-02 / PR #22).</b>
+/// <c>macro_data_misses</c> migrated from point-shape
+/// (series_id, observation_date) → range-shape
+/// (series_id, range_from, range_to) in migration 011. The gap detector
+/// now uses an expected-minus-cached-minus-marked set diff (matching
+/// PRs #19 / #20 / #21) instead of count-based comparison: enumerate the
+/// expected publication boundaries (Daily = every Mon-Fri; Monthly =
+/// first-of-month), drop dates already cached, drop dates shadowed by an
+/// existing marker range, and fetch what is left. Empty FRED responses
+/// produce ONE marker row per contiguous run via
+/// <see cref="RangeMarkerWriter"/> (coalesce-on-write merges adjacent
+/// existing markers).
 /// </para>
 /// </summary>
 public sealed class MacroDataProvider : IMacroDataProvider
@@ -91,9 +106,10 @@ public sealed class MacroDataProvider : IMacroDataProvider
     /// <summary>
     /// Identify gaps in the macro cache for the requested range, fetch
     /// them from FRED (concurrency-gated by <see cref="IFredFetcher"/>),
-    /// upsert into <c>macro_data</c>, record miss-markers for empty
-    /// returns. Cold-start (empty table) collapses to a single full-range
-    /// fetch per series; warm cache short-circuits with no FRED calls.
+    /// upsert into <c>macro_data</c>, record range-shape miss-markers for
+    /// empty returns. Cold-start (empty table) collapses to a single
+    /// full-range fetch per series; warm cache short-circuits with no
+    /// FRED calls.
     /// </summary>
     public async Task EnsureRangeCachedAsync(
         string seriesId, DateOnly fromDate, DateOnly toDate,
@@ -117,96 +133,146 @@ public sealed class MacroDataProvider : IMacroDataProvider
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
-        // Cached + marker count. Pass DateOnly as ISO strings + ::date cast —
-        // Dapper's binder doesn't support DateOnly natively in older Npgsql.
-        var cachedCount = await conn.ExecuteScalarAsync<long>(
+        // 1. Expected publication boundaries.
+        var expected = EnumerateBoundaries(fromDate, toDate, cadence).ToList();
+        if (expected.Count == 0)
+        {
+            _logger.LogDebug(
+                "No expected boundaries for {Series} {From}..{To} ({Cadence}) — skip",
+                seriesId, fromDate, toDate, cadence);
+            return;
+        }
+
+        // 2. Cached observation dates. Read DATE column as text + parse so
+        //    Dapper does not fight Npgsql's DATE → DateOnly mapping.
+        var cachedRows = await conn.QueryAsync<string>(
             """
-            SELECT COUNT(*) FROM macro_data
+            SELECT observation_date::text FROM macro_data
             WHERE series_id = @SeriesId
               AND observation_date >= @From::date AND observation_date <= @To::date
             """,
-            new { SeriesId = seriesId, From = fromDate.ToString("yyyy-MM-dd"), To = toDate.ToString("yyyy-MM-dd") });
+            new
+            {
+                SeriesId = seriesId,
+                From = fromDate.ToString("yyyy-MM-dd"),
+                To = toDate.ToString("yyyy-MM-dd"),
+            });
+        var cached = new HashSet<DateOnly>(cachedRows.Select(d => DateOnly.Parse(d)));
 
-        var markerCount = await conn.ExecuteScalarAsync<long>(
+        // 3. Existing range markers that overlap the window.
+        var markerRows = (await conn.QueryAsync<(string RangeFrom, string RangeTo)>(
             """
-            SELECT COUNT(*) FROM macro_data_misses
+            SELECT range_from::text AS RangeFrom, range_to::text AS RangeTo
+            FROM macro_data_misses
             WHERE series_id = @SeriesId
-              AND observation_date >= @From::date AND observation_date <= @To::date
+              AND range_to >= @From::date AND range_from <= @To::date
             """,
-            new { SeriesId = seriesId, From = fromDate.ToString("yyyy-MM-dd"), To = toDate.ToString("yyyy-MM-dd") });
+            new
+            {
+                SeriesId = seriesId,
+                From = fromDate.ToString("yyyy-MM-dd"),
+                To = toDate.ToString("yyyy-MM-dd"),
+            }))
+            .Select(r => (From: DateOnly.Parse(r.RangeFrom), To: DateOnly.Parse(r.RangeTo)))
+            .ToList();
 
-        var expected = cadence == FredSeriesCadence.Daily
-            ? CountWeekdays(fromDate, toDate)
-            : CountMonthBoundaries(fromDate, toDate);
+        // 4. expected − cached − marked.
+        var missing = new List<DateOnly>(expected.Count);
+        foreach (var date in expected)
+        {
+            if (cached.Contains(date)) continue;
+            var shadowed = false;
+            foreach (var marker in markerRows)
+            {
+                if (date >= marker.From && date <= marker.To) { shadowed = true; break; }
+            }
+            if (!shadowed) missing.Add(date);
+        }
 
-        if (cachedCount + markerCount >= expected)
+        if (missing.Count == 0)
         {
             _metrics?.RecordCacheHit(MetricKind.Macro);
             _logger.LogDebug(
-                "Macro cache fully covers {Series} {From}..{To} ({Cached} rows + {Markers} markers >= {Expected} expected) — no FRED fetch",
-                seriesId, fromDate, toDate, cachedCount, markerCount, expected);
+                "Macro cache fully covers {Series} {From}..{To} ({Cadence}) (expected={Expected}, cached={Cached}, marked-ranges={Markers}) — no FRED fetch",
+                seriesId, fromDate, toDate, cadence, expected.Count, cached.Count, markerRows.Count);
             return;
         }
 
         _logger.LogInformation(
-            "Macro cache gap for {Series} {From}..{To} ({Cached} rows + {Markers} markers < {Expected} expected) — fetching from FRED",
-            seriesId, fromDate, toDate, cachedCount, markerCount, expected);
+            "Macro gap for {Series} {From}..{To} ({Cadence}): {Missing} boundaries missing (expected={Expected}, cached={Cached}, marked-ranges={Markers}) — fetching from FRED",
+            seriesId, fromDate, toDate, cadence,
+            missing.Count, expected.Count, cached.Count, markerRows.Count);
 
-        var fetched = await _fredFetcher.FetchSeriesAsync(
-            seriesId, fromDate, toDate, ct);
+        // 5. Fetch the full window from FRED. FRED's range fetch returns
+        //    every observation in [from, to] in a single call — no need
+        //    to chunk. Using fromDate/toDate gives FRED the broadest
+        //    window; we filter cached/marked locally.
+        var fetched = await _fredFetcher.FetchSeriesAsync(seriesId, fromDate, toDate, ct);
 
-        if (fetched.Count == 0)
-        {
-            // FRED returned nothing for the entire window. Write a marker per
-            // expected cadence boundary so we don't loop. Markers are
-            // idempotent (PK).
-            await RecordRangeMissAsync(conn, seriesId, fromDate, toDate, cadence,
-                "no-data-from-fred", ct);
-            _metrics?.RecordMissMarker(MetricKind.Macro);
-            return;
-        }
-
-        // Upsert observations. FRED's "." sentinel surfaces as null Value —
-        // we record those as miss-markers (FRED knows the date is a
-        // publication boundary but has no value to publish, e.g. holiday
-        // on a daily series). Real values go to macro_data.
+        // 6. Upsert real values; collect FRED-null observations + boundaries
+        //    FRED did not return at all into a single set for marker writes.
         var upserts = 0;
-        var markers = 0;
+        var nullValueDates = new List<DateOnly>();
         var returnedDates = new HashSet<DateOnly>();
         foreach (var row in fetched)
         {
             returnedDates.Add(row.ObservationDate);
             if (row.Value is null)
             {
-                await RecordSingleMissAsync(conn, seriesId, row.ObservationDate,
-                    "fred-null-value", ct);
-                markers++;
+                nullValueDates.Add(row.ObservationDate);
             }
             else
             {
-                await UpsertObservationAsync(conn, seriesId, row.ObservationDate,
-                    row.Value.Value, ct);
+                await UpsertObservationAsync(conn, seriesId, row.ObservationDate, row.Value.Value, ct);
                 upserts++;
             }
         }
 
-        // Any expected publication boundary FRED did not return at all also
-        // gets a marker. This bounds re-fetching: a permanently-stale series
-        // writes a full marker set on the first run, hits the fast path on
-        // every subsequent one.
-        var unreturnedMarkers = await BackfillMissingBoundaryMarkersAsync(
-            conn, seriesId, fromDate, toDate, cadence, returnedDates, ct);
+        // Boundaries inside the missing-set that FRED did not return at all.
+        var notReturned = missing.Where(d => !returnedDates.Contains(d)).ToList();
 
-        if (markers + unreturnedMarkers > 0)
+        // 7. Coalesce-on-write all marker dates as range markers. Two
+        //    sources combine: FRED's null-value dates + boundaries-not-
+        //    returned. Coalesce contiguous publication boundaries into one
+        //    range row per cadence.
+        var markerDates = new List<DateOnly>(nullValueDates.Count + notReturned.Count);
+        markerDates.AddRange(nullValueDates);
+        markerDates.AddRange(notReturned);
+        var rangesWritten = 0;
+        if (markerDates.Count > 0)
         {
-            // One miss-marker counter increment per warmup that produced
-            // any markers — keeps the counter granular but cheap.
+            var ranges = CoalesceContiguousBoundaries(markerDates, cadence);
+            var rangesUtc = ranges
+                .Select(r => (
+                    From: new DateTimeOffset(r.From.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero),
+                    To: new DateTimeOffset(r.To.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero)))
+                .ToList<(DateTimeOffset From, DateTimeOffset To)>();
+
+            // Adjacency for cross-run coalesce-on-write:
+            //   Daily: 3 days (covers a Fri..Mon weekend gap so Friday's
+            //     marker and Monday's marker from two separate runs merge).
+            //   Monthly: 32 days (covers a month-to-month succession).
+            var adjacencyTicks = cadence == FredSeriesCadence.Daily
+                ? TimeSpan.FromDays(3).Ticks
+                : TimeSpan.FromDays(32).Ticks;
+
+            var keyValues = new[]
+            {
+                new KeyValuePair<string, object>("SeriesId", seriesId),
+            };
+
+            rangesWritten = await RangeMarkerWriter.WriteAsync(
+                conn, MacroMissTableSpec, keyValues,
+                rangesUtc, "fred-no-data",
+                inAdjacencyTicks: adjacencyTicks,
+                inCt: ct).ConfigureAwait(false);
+
             _metrics?.RecordMissMarker(MetricKind.Macro);
         }
 
         _logger.LogInformation(
-            "Macro on-demand fill: {Series} {From}..{To} → {Upserts} values upserted, {Markers} missing-value markers, {Boundary} boundary markers",
-            seriesId, fromDate, toDate, upserts, markers, unreturnedMarkers);
+            "Macro on-demand fill: {Series} {From}..{To} → {Upserts} values upserted, {NullValues} fred-null dates, {NotReturned} not-returned dates, {RangesWritten} marker ranges in table",
+            seriesId, fromDate, toDate, upserts, nullValueDates.Count, notReturned.Count, rangesWritten);
     }
 
     /// <inheritdoc/>
@@ -264,64 +330,11 @@ public sealed class MacroDataProvider : IMacroDataProvider
             new { SeriesId = seriesId, Date = date.ToString("yyyy-MM-dd"), Value = value });
     }
 
-    private static async Task RecordSingleMissAsync(
-        NpgsqlConnection conn, string seriesId, DateOnly date, string reason,
-        CancellationToken ct)
-    {
-        await conn.ExecuteAsync(
-            """
-            INSERT INTO macro_data_misses (series_id, observation_date, reason, fetched_at)
-            VALUES (@SeriesId, @Date::date, @Reason, NOW())
-            ON CONFLICT (series_id, observation_date) DO NOTHING
-            """,
-            new { SeriesId = seriesId, Date = date.ToString("yyyy-MM-dd"), Reason = reason });
-    }
-
-    /// <summary>
-    /// Empty FRED response → mark every expected publication boundary in
-    /// the requested window. For Daily: every Mon-Fri. For Monthly: the
-    /// first day of every month boundary in [from, to]. Subsequent runs
-    /// see the marker count match expected and skip the fetch.
-    /// </summary>
-    private async Task RecordRangeMissAsync(
-        NpgsqlConnection conn, string seriesId, DateOnly from, DateOnly to,
-        FredSeriesCadence cadence, string reason, CancellationToken ct)
-    {
-        var rows = 0;
-        foreach (var date in EnumerateBoundaries(from, to, cadence))
-        {
-            await RecordSingleMissAsync(conn, seriesId, date, reason, ct);
-            rows++;
-        }
-        _logger.LogInformation(
-            "Recorded {Count} miss-markers for {Series} {From}..{To} ({Reason})",
-            rows, seriesId, from, to, reason);
-    }
-
-    /// <summary>
-    /// After an on-demand fetch, mark any expected boundary FRED did not
-    /// return at all. Distinguishes "FRED has no data on this date" (the
-    /// "." sentinel, recorded above as a single-miss) from "FRED skipped
-    /// this date in its response", which is the same symptom from the
-    /// cache's perspective: the boundary is unfetchable.
-    /// </summary>
-    private static async Task<int> BackfillMissingBoundaryMarkersAsync(
-        NpgsqlConnection conn, string seriesId, DateOnly from, DateOnly to,
-        FredSeriesCadence cadence, HashSet<DateOnly> returned, CancellationToken ct)
-    {
-        var count = 0;
-        foreach (var date in EnumerateBoundaries(from, to, cadence))
-        {
-            if (returned.Contains(date)) continue;
-            await RecordSingleMissAsync(conn, seriesId, date, "fred-not-returned", ct);
-            count++;
-        }
-        return count;
-    }
-
     // ── Cadence math (pure, internal for tests) ─────────────────────────
 
-    /// <summary>Count Mon-Fri days in [start, end] inclusive.</summary>
+    /// <summary>Count Mon-Fri days in [start, end] inclusive. Kept for
+    /// callers (e.g. legacy expected-count math); not used by the new
+    /// expected-set gap detector but stable as a pure helper.</summary>
     internal static int CountWeekdays(DateOnly start, DateOnly end)
     {
         if (start > end) return 0;
@@ -380,4 +393,82 @@ public sealed class MacroDataProvider : IMacroDataProvider
             }
         }
     }
+
+    /// <summary>
+    /// Coalesce a set of publication boundaries into the minimal set of
+    /// contiguous ranges per cadence. Two boundaries are "contiguous" iff
+    /// no expected boundary of the given cadence falls strictly between
+    /// them. Internal so unit tests can pin the math directly.
+    ///
+    /// <para>
+    /// For Daily: Fri 4/17 + Mon 4/20 are contiguous (no business days
+    /// strictly between — the weekend doesn't count). Tue 4/14 + Thu 4/16
+    /// are NOT contiguous (Wed 4/15 is an expected boundary in between).
+    /// </para>
+    ///
+    /// <para>
+    /// For Monthly: Apr 1 + May 1 are contiguous. Apr 1 + Jun 1 are NOT
+    /// (May 1 is an expected boundary in between).
+    /// </para>
+    /// </summary>
+    internal static List<(DateOnly From, DateOnly To)> CoalesceContiguousBoundaries(
+        IEnumerable<DateOnly> inDates, FredSeriesCadence inCadence)
+    {
+        var sorted = inDates.Distinct().OrderBy(d => d).ToList();
+        if (sorted.Count == 0) return new List<(DateOnly, DateOnly)>();
+
+        var result = new List<(DateOnly From, DateOnly To)>();
+        var rangeStart = sorted[0];
+        var rangeEnd = sorted[0];
+        for (var i = 1; i < sorted.Count; i++)
+        {
+            var next = sorted[i];
+            var hasBoundaryBetween = HasBoundaryStrictlyBetween(rangeEnd, next, inCadence);
+            if (!hasBoundaryBetween)
+            {
+                rangeEnd = next;
+            }
+            else
+            {
+                result.Add((rangeStart, rangeEnd));
+                rangeStart = next;
+                rangeEnd = next;
+            }
+        }
+        result.Add((rangeStart, rangeEnd));
+        return result;
+    }
+
+    /// <summary>True iff there is at least one expected boundary of the
+    /// given cadence strictly between <paramref name="inA"/> and
+    /// <paramref name="inB"/> (exclusive at both ends).</summary>
+    private static bool HasBoundaryStrictlyBetween(
+        DateOnly inA, DateOnly inB, FredSeriesCadence inCadence)
+    {
+        if (inA >= inB) return false;
+        var probeStart = inA.AddDays(1);
+        var probeEnd = inB.AddDays(-1);
+        if (probeStart > probeEnd) return false;
+        foreach (var _ in EnumerateBoundaries(probeStart, probeEnd, inCadence))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Schema descriptor for <c>macro_data_misses</c> (range-shape post
+    /// migration 011). DATE-typed range columns; the writer's
+    /// <see cref="RangeMarkerColumnType.Date"/> spec ensures the
+    /// timestamptz-cast on read and date-cast on write are wired.
+    /// </summary>
+    internal static readonly RangeMarkerTableSpec MacroMissTableSpec = new(
+        TableName: "macro_data_misses",
+        KeyColumns: new[] { "series_id" },
+        RangeFromColumn: "range_from",
+        RangeToColumn: "range_to",
+        FetchedAtColumn: "fetched_at",
+        HasReasonColumn: true,
+        ReasonColumn: "reason",
+        RangeColumnType: RangeMarkerColumnType.Date);
 }

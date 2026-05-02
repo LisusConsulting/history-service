@@ -747,11 +747,12 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
             CREATE UNIQUE INDEX IF NOT EXISTS uq_macro_series_date
               ON macro_data (series_id, observation_date);
             CREATE TABLE IF NOT EXISTS macro_data_misses (
-              series_id        VARCHAR(20)  NOT NULL,
-              observation_date DATE         NOT NULL,
-              reason           TEXT,
-              fetched_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-              PRIMARY KEY (series_id, observation_date)
+              series_id   VARCHAR(20)  NOT NULL,
+              range_from  DATE         NOT NULL,
+              range_to    DATE         NOT NULL,
+              reason      TEXT,
+              fetched_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (series_id, range_from, range_to)
             );
             """);
     }
