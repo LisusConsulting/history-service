@@ -18,6 +18,8 @@
     <PackageReference Include="Shouldly" />
     <PackageReference Include="Testcontainers" />
     <PackageReference Include="Testcontainers.PostgreSql" />
+    <!-- PR 3 — FakeTimeProvider for the daily-flow refresh cron tests. -->
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <!-- micro-PR #2 (bars) + #3 (NBBO) — Testcontainers tests apply
          schema inline (rather than mounting migration .sql files) so
          the test stays hermetic. Dapper for the helpers and Npgsql for
