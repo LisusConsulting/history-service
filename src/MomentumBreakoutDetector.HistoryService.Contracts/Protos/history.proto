@@ -51,6 +51,14 @@ service HistoryService {
   // engine never reads this table — it computes flow on-the-fly per signal
   // cycle from the current chain. Backtests read past-day rows here.
   rpc GetDailyOptionsFlow (GetDailyOptionsFlowRequest) returns (GetDailyOptionsFlowResponse);
+
+  // ---- Daily ATM-IV read (Wave B / PR 5 of the ATM-IV plan).
+  // Past-only: rejects today-or-later. Aggregated ATM IV across the
+  // ATM±5% × 0-60 DTE band per (underlying, trade_date), populated by
+  // PR 6 (Wave C) daily 08:00 ET cron and the Wave C/D backfill seeder
+  // mode --surface daily_atm_iv. Read-only here; no upstream fetch on
+  // miss (consumers run the seeder/cron first to populate a window).
+  rpc GetDailyAtmIv (GetDailyAtmIvRequest) returns (GetDailyAtmIvResponse);
 }
 
 // ----------------------------------------------------------------------------
@@ -287,5 +295,40 @@ message DailyOptionsFlowRow {
 
 message GetDailyOptionsFlowResponse {
   repeated DailyOptionsFlowRow rows = 1;
+  bool cache_hit = 2;                            // always true — no upstream on miss
+}
+
+// ----------------------------------------------------------------------------
+// GetDailyAtmIv — read aggregated ATM-IV rows over [from, to] for one
+// underlying. Past-only guard rejects today-or-later (the live engine
+// computes today's IV on-the-fly from the current snapshot/chain). No
+// upstream fetch on miss — populated exclusively by the Wave C / PR 6
+// daily 08:00 ET cron and the Wave C/D backfill seeder mode
+// --surface daily_atm_iv.
+// ----------------------------------------------------------------------------
+message GetDailyAtmIvRequest {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp from_date = 2;       // date — time component ignored
+  google.protobuf.Timestamp to_date = 3;         // date — time component ignored, inclusive
+}
+
+message DailyAtmIvRow {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp trade_date = 2;      // date — UTC midnight
+  // atm_iv may be unset in the source row when the aggregate had zero
+  // valid contracts (all NULL IV after solver failures). The boolean
+  // flag distinguishes "0.0 known" from "NULL — no flow signal" so the
+  // wire payload doesn't conflate them.
+  double atm_iv = 3;
+  bool atm_iv_is_null = 4;
+  // contract_count = how many distinct ATM-band contracts contributed
+  // to the day's aggregate. Useful for sanity-checking sparse-data
+  // days. May be NULL when atm_iv is NULL (e.g. on a marker-only day).
+  int32 contract_count = 5;
+  bool contract_count_is_null = 6;
+}
+
+message GetDailyAtmIvResponse {
+  repeated DailyAtmIvRow rows = 1;
   bool cache_hit = 2;                            // always true — no upstream on miss
 }
