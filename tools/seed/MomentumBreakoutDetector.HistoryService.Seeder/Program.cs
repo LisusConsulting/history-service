@@ -56,6 +56,8 @@ try
                 return await RunBarsSurfaceAsync(tmpOpts, tmpLogWriter, tmpCts.Token);
             case Surface.DailyOptionsFlow:
                 return await RunDailyOptionsFlowSurfaceAsync(tmpOpts, tmpLogWriter, tmpCts.Token);
+            case Surface.OptionsSnapshots:
+                return await RunOptionsSnapshotsSurfaceAsync(tmpOpts, tmpLogWriter, tmpCts.Token);
             default:
                 throw new ArgumentException($"Unsupported surface: {tmpOpts.Surface}");
         }
@@ -134,6 +136,33 @@ static async Task<int> RunDailyOptionsFlowSurfaceAsync(SeedOptions inOpts, Strea
     return 0;
 }
 
+static async Task<int> RunOptionsSnapshotsSurfaceAsync(SeedOptions inOpts, StreamWriter? inLogWriter, CancellationToken inCt)
+{
+    if (inOpts.ComputeMethod != SnapshotComputeMethod.Bs)
+    {
+        throw new ArgumentException(
+            $"--compute-method {inOpts.ComputeMethod.ToString().ToLowerInvariant()} is reserved; only 'bs' is implemented in PR 3.");
+    }
+
+    var tmpConn = ResolvePostgresConnection(inOpts);
+    Console.WriteLine($"[seeder] surface=options_snapshots compute=bs symbol={inOpts.Symbol} " +
+                      $"db-host={ExtractDbHost(tmpConn)} " +
+                      $"strike-band=±{inOpts.StrikeBandPct:P0} dte-max={inOpts.SnapshotDteMaxDays}");
+
+    // Solver is stateless — just `new` it. No DI container needed for a
+    // one-shot CLI tool.
+    var tmpSolver = new MomentumBreakoutDetector.HistoryService.Pricing.BlackScholes.BlackScholesSolver();
+
+    var tmpCp = await Checkpoint.LoadOrCreateAsync(
+        inOpts.CheckpointFile, inOpts.Symbol, Surface.OptionsSnapshots, inCt);
+    Console.WriteLine($"[seeder] checkpoint: lastCompleted={tmpCp.LastCompletedDate?.ToString("yyyy-MM-dd") ?? "<none>"} " +
+                      $"daysFetched={tmpCp.TotalDaysFetched} surface={tmpCp.Surface}");
+
+    var tmpEngine = new OptionsSnapshotsSeederEngine(inOpts, tmpCp, tmpSolver, tmpConn, inLogWriter);
+    await tmpEngine.RunAsync(inCt);
+    return 0;
+}
+
 static string ResolvePostgresConnection(SeedOptions inOpts)
 {
     if (!string.IsNullOrWhiteSpace(inOpts.PostgresConn)) return inOpts.PostgresConn!;
@@ -178,6 +207,8 @@ static SeedOptions ParseArgs(string[] inArgs)
     Surface tmpSurface = Surface.Bars;
     string? tmpPostgresConn = null;
     int tmpFlowMaxDte = 60;
+    SnapshotComputeMethod tmpComputeMethod = SnapshotComputeMethod.Bs;
+    int tmpSnapshotDte = 60;
 
     for (int i = 0; i < inArgs.Length; i++)
     {
@@ -198,6 +229,8 @@ static SeedOptions ParseArgs(string[] inArgs)
             case "--dte-max-days":       tmpDte = int.Parse(Require(tmpKey, tmpVal), CultureInfo.InvariantCulture); i++; break;
             case "--postgres-conn":      tmpPostgresConn = Require(tmpKey, tmpVal); i++; break;
             case "--flow-max-dte":       tmpFlowMaxDte = int.Parse(Require(tmpKey, tmpVal), CultureInfo.InvariantCulture); i++; break;
+            case "--compute-method":     tmpComputeMethod = ParseComputeMethod(Require(tmpKey, tmpVal)); i++; break;
+            case "--snapshot-dte-max-days": tmpSnapshotDte = int.Parse(Require(tmpKey, tmpVal), CultureInfo.InvariantCulture); i++; break;
             case "-h":
             case "--help":
                 PrintUsage();
@@ -228,6 +261,8 @@ static SeedOptions ParseArgs(string[] inArgs)
         DteMaxDays = tmpDte,
         PostgresConn = tmpPostgresConn,
         FlowMaxDte = tmpFlowMaxDte,
+        ComputeMethod = tmpComputeMethod,
+        SnapshotDteMaxDays = tmpSnapshotDte,
     };
 }
 
@@ -235,7 +270,17 @@ static Surface ParseSurface(string inValue) => inValue.ToLowerInvariant() switch
 {
     "bars" => Surface.Bars,
     "daily_options_flow" or "daily-options-flow" or "dailyoptionsflow" => Surface.DailyOptionsFlow,
-    _ => throw new ArgumentException($"unknown --surface value: {inValue} (expected: bars | daily_options_flow)"),
+    "options_snapshots" or "options-snapshots" or "optionssnapshots" => Surface.OptionsSnapshots,
+    _ => throw new ArgumentException(
+        $"unknown --surface value: {inValue} (expected: bars | daily_options_flow | options_snapshots)"),
+};
+
+static SnapshotComputeMethod ParseComputeMethod(string inValue) => inValue.ToLowerInvariant() switch
+{
+    "bs" or "black-scholes" or "black_scholes" => SnapshotComputeMethod.Bs,
+    "polygon" => SnapshotComputeMethod.Polygon,
+    _ => throw new ArgumentException(
+        $"unknown --compute-method value: {inValue} (expected: bs | polygon)"),
 };
 
 static string Require(string inKey, string? inVal)
@@ -271,9 +316,25 @@ static void PrintUsage()
             [--flow-max-dte 60] \
             [--log-file ./seed.flow.log]
 
+          # Options-snapshots surface, Black-Scholes compute (Wave B / PR 3 of ATM-IV plan):
+          dotnet run --project tools/seed/MomentumBreakoutDetector.HistoryService.Seeder -- \
+            --surface options_snapshots \
+            --compute-method bs \
+            --symbol TSLA \
+            --from 2022-08-25 \
+            --to   2026-04-13 \
+            --checkpoint-file ./checkpoint.tsla-snapshots-bs.json \
+            --postgres-conn "Host=localhost;Port=35432;Database=mbd_history;Username=mbd;Password=mbd" \
+            [--strike-band-pct 0.05] \
+            [--snapshot-dte-max-days 60] \
+            [--log-file ./seed.snapshots-bs.log]
+
         Env vars consumed by the daily-options-flow surface:
           HISTORY__CONNECTIONSTRING — fallback for --postgres-conn
           HISTORY__POLYGONAPIKEY    — Polygon API key (required)
+        Env var consumed by the options-snapshots surface:
+          HISTORY__CONNECTIONSTRING — fallback for --postgres-conn
+          (no Polygon key — solver reads from local DB only)
 
         See tools/seed/README.md for the full operator runbook.
         """);
