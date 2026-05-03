@@ -58,6 +58,8 @@ try
                 return await RunDailyOptionsFlowSurfaceAsync(tmpOpts, tmpLogWriter, tmpCts.Token);
             case Surface.OptionsSnapshots:
                 return await RunOptionsSnapshotsSurfaceAsync(tmpOpts, tmpLogWriter, tmpCts.Token);
+            case Surface.DailyAtmIv:
+                return await RunDailyAtmIvSurfaceAsync(tmpOpts, tmpLogWriter, tmpCts.Token);
             default:
                 throw new ArgumentException($"Unsupported surface: {tmpOpts.Surface}");
         }
@@ -159,6 +161,22 @@ static async Task<int> RunOptionsSnapshotsSurfaceAsync(SeedOptions inOpts, Strea
                       $"daysFetched={tmpCp.TotalDaysFetched} surface={tmpCp.Surface}");
 
     var tmpEngine = new OptionsSnapshotsSeederEngine(inOpts, tmpCp, tmpSolver, tmpConn, inLogWriter);
+    await tmpEngine.RunAsync(inCt);
+    return 0;
+}
+
+static async Task<int> RunDailyAtmIvSurfaceAsync(SeedOptions inOpts, StreamWriter? inLogWriter, CancellationToken inCt)
+{
+    var tmpConn = ResolvePostgresConnection(inOpts);
+    Console.WriteLine($"[seeder] surface=daily_atm_iv symbol={inOpts.Symbol} " +
+                      $"db-host={ExtractDbHost(tmpConn)} window={inOpts.From:yyyy-MM-dd}..{inOpts.To:yyyy-MM-dd}");
+
+    var tmpCp = await Checkpoint.LoadOrCreateAsync(
+        inOpts.CheckpointFile, inOpts.Symbol, Surface.DailyAtmIv, inCt);
+    Console.WriteLine($"[seeder] checkpoint: lastCompleted={tmpCp.LastCompletedDate?.ToString("yyyy-MM-dd") ?? "<none>"} " +
+                      $"daysFetched={tmpCp.TotalDaysFetched} surface={tmpCp.Surface}");
+
+    var tmpEngine = DailyAtmIvSeederEngine.Create(inOpts, tmpCp, tmpConn, inLogWriter);
     await tmpEngine.RunAsync(inCt);
     return 0;
 }
@@ -271,8 +289,9 @@ static Surface ParseSurface(string inValue) => inValue.ToLowerInvariant() switch
     "bars" => Surface.Bars,
     "daily_options_flow" or "daily-options-flow" or "dailyoptionsflow" => Surface.DailyOptionsFlow,
     "options_snapshots" or "options-snapshots" or "optionssnapshots" => Surface.OptionsSnapshots,
+    "daily_atm_iv" or "daily-atm-iv" or "dailyatmiv" => Surface.DailyAtmIv,
     _ => throw new ArgumentException(
-        $"unknown --surface value: {inValue} (expected: bars | daily_options_flow | options_snapshots)"),
+        $"unknown --surface value: {inValue} (expected: bars | daily_options_flow | options_snapshots | daily_atm_iv)"),
 };
 
 static SnapshotComputeMethod ParseComputeMethod(string inValue) => inValue.ToLowerInvariant() switch
