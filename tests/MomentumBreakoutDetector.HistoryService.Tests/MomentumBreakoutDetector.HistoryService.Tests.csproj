@@ -40,6 +40,8 @@
          seeder tooling project. The seeder project transitively references
          the service project so this does not double-link proto types. -->
     <ProjectReference Include="..\..\tools\seed\MomentumBreakoutDetector.HistoryService.Seeder\MomentumBreakoutDetector.HistoryService.Seeder.csproj" />
+    <!-- PR 9 — pin the bootstrap-import filter predicate. -->
+    <ProjectReference Include="..\..\tools\import-mbd-snapshots\MomentumBreakoutDetector.HistoryService.ImportMbdSnapshots.csproj" />
   </ItemGroup>
 
 </Project>
