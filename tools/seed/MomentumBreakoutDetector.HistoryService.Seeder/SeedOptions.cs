@@ -22,6 +22,11 @@ public enum Surface
     /// into the <c>historical_options_snapshots</c> hypertable. Compute method governed by
     /// <see cref="SeedOptions.ComputeMethod"/>.</summary>
     OptionsSnapshots = 2,
+    /// <summary>Wave C / PR 6 backfill (ATM-IV plan): per-(symbol, trade_date) aggregate of
+    /// the <c>historical_options_snapshots</c> ATM band into the <c>daily_atm_iv</c>
+    /// table. Used to roll up Step 3's BS-computed snapshot rows after that
+    /// backfill completes; the daily 08:00 ET cron handles forward-going days.</summary>
+    DailyAtmIv = 3,
 }
 
 /// <summary>

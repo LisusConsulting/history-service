@@ -123,6 +123,12 @@ builder.Services.AddScoped<IDailyOptionsFlowProvider, DailyOptionsFlowProvider>(
 // daily_atm_iv) land cleanly without re-touching this registration.
 builder.Services.AddScoped<IDailyAtmIvProvider, DailyAtmIvProvider>();
 
+// Wave C / PR 6 — aggregator (pure read of historical_options_snapshots
+// → DailyAtmIvRow) shared by the daily 08:00 ET cron and the seeder
+// backfill surface (--surface daily_atm_iv). Scoped so the registration
+// graph matches the rest of the providers.
+builder.Services.AddScoped<IDailyAtmIvAggregator, DailyAtmIvAggregator>();
+
 // PR 3 — per-day computer used by both the cron and (transitively) the
 // seeder via the same algorithm. Scoped because IOptionsService from the
 // SDK is registered transient — taking it scoped keeps the resolution
@@ -158,6 +164,14 @@ builder.Services.AddSingleton<
 builder.Services.Configure<DailyOptionsFlowRefreshOptions>(
     builder.Configuration.GetSection(DailyOptionsFlowRefreshOptions.SectionName));
 builder.Services.AddHostedService<DailyOptionsFlowRefreshService>();
+
+// Wave C / PR 6 — daily_atm_iv refresh cron (08:00 ET, weekdays). Same
+// shape as the daily-flow cron but fans out via the snapshot aggregator
+// rather than the polygon flow computer. Bind from
+// History:DailyAtmIvRefresh.
+builder.Services.Configure<DailyAtmIvRefreshOptions>(
+    builder.Configuration.GetSection(DailyAtmIvRefreshOptions.SectionName));
+builder.Services.AddHostedService<DailyAtmIvRefreshService>();
 
 // --- Live-capture cron (Wave B / PR 4 of the ATM-IV plan) ---------------
 // Captures Polygon /v3/snapshot/options/{underlying} every 5 min during
