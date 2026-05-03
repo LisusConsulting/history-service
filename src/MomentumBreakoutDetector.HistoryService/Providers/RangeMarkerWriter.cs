@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text;
 using Dapper;
 using Npgsql;
 
@@ -119,9 +121,50 @@ public static class RangeMarkerWriter
         // DELETE-then-INSERT under a transaction so a concurrent reader
         // sees either the old or the new marker set, not a half-written
         // intermediate.
+        //
+        // Concurrency hazard (fixed 2026-05-02): two writers racing on the
+        // same key would both read the existing-row set, both DELETE 0
+        // rows (or the same N rows), and both INSERT — second writer hits
+        // 23505 unique-violation on the table's PK
+        // (e.g. macro_data_misses_v2_pkey). Default READ COMMITTED
+        // isolation does not prevent this because each writer's snapshot
+        // sees no rows the other has written until that other commits.
+        //
+        // Fix: serialize writers competing for the same composite key via
+        // pg_advisory_xact_lock(table_name_hash, key_hash). The lock is
+        // held until the transaction ends (commit or rollback) and only
+        // collides with other writers on the same (table, key) pair —
+        // writers for different keys (e.g. T10Y2Y vs CPIAUCSL) proceed
+        // in parallel as before. Single round-trip; no extra schema.
         await using var tmpTx = await inConn.BeginTransactionAsync(inCt).ConfigureAwait(false);
         try
         {
+            var tmpTableHash = StableHashInt32(inSpec.TableName);
+            var tmpKeyHash = StableHashInt32(BuildKeyHashSeed(inKeyValues));
+            await inConn.ExecuteAsync(
+                "SELECT pg_advisory_xact_lock(@TableHash, @KeyHash)",
+                new { TableHash = tmpTableHash, KeyHash = tmpKeyHash },
+                tmpTx).ConfigureAwait(false);
+
+            // Re-read existing rows under the lock. The earlier read
+            // (above, outside the lock) was speculative — useful so we
+            // don't take the lock when there is nothing to write — but
+            // a concurrent writer may have committed between that read
+            // and acquiring the lock. Re-read so the merge reflects the
+            // final post-lock state and the DELETE-then-INSERT is
+            // serialised correctly.
+            var tmpExistingUnderLock = (await inConn.QueryAsync<(DateTimeOffset From, DateTimeOffset To)>(
+                $"""
+                SELECT {inSpec.RangeFromColumn}::timestamptz AS "From",
+                       {inSpec.RangeToColumn}::timestamptz   AS "To"
+                FROM {inSpec.TableName}
+                WHERE {tmpKeyWhere}
+                """, tmpKeyParams, tmpTx).ConfigureAwait(false)).ToList();
+            tmpAll.Clear();
+            tmpAll.AddRange(tmpExistingUnderLock);
+            tmpAll.AddRange(inNewRanges);
+            tmpMerged = Coalesce(tmpAll, inAdjacencyTicks);
+
             await inConn.ExecuteAsync(
                 $"DELETE FROM {inSpec.TableName} WHERE {tmpKeyWhere}",
                 tmpKeyParams, tmpTx).ConfigureAwait(false);
@@ -211,6 +254,50 @@ public static class RangeMarkerWriter
         }
         tmpResult.Add((tmpCurFrom, tmpCurTo));
         return tmpResult;
+    }
+
+    /// <summary>
+    /// Build a stable string seed from a composite-key value list for
+    /// hashing into a pg advisory-lock key. Format:
+    /// <c>name1=value1|name2=value2|…</c> with invariant-culture
+    /// formatting on each value so culture-sensitive callers (e.g. a
+    /// numeric key in a non-US locale) hash identically across hosts.
+    /// </summary>
+    private static string BuildKeyHashSeed(
+        IReadOnlyList<KeyValuePair<string, object>> inKeyValues)
+    {
+        var tmpSb = new StringBuilder(inKeyValues.Count * 24);
+        for (var i = 0; i < inKeyValues.Count; i++)
+        {
+            if (i > 0) tmpSb.Append('|');
+            tmpSb.Append(inKeyValues[i].Key);
+            tmpSb.Append('=');
+            tmpSb.Append(Convert.ToString(inKeyValues[i].Value, CultureInfo.InvariantCulture));
+        }
+        return tmpSb.ToString();
+    }
+
+    /// <summary>
+    /// Deterministic 32-bit hash for an arbitrary string. Used as a
+    /// pg advisory-lock key argument. We deliberately avoid
+    /// <see cref="string.GetHashCode()"/> because the runtime randomises
+    /// it per-process — two history-service replicas would lock on
+    /// different keys and not see each other. FNV-1a 32-bit gives a
+    /// stable, fast, dependency-free hash that suits the 32-bit
+    /// pg_advisory_xact_lock(int4,int4) contract.
+    /// </summary>
+    internal static int StableHashInt32(string inValue)
+    {
+        // FNV-1a 32-bit
+        const uint kFnvOffsetBasis = 2166136261u;
+        const uint kFnvPrime = 16777619u;
+        var tmpHash = kFnvOffsetBasis;
+        for (var i = 0; i < inValue.Length; i++)
+        {
+            tmpHash ^= inValue[i];
+            tmpHash *= kFnvPrime;
+        }
+        return unchecked((int)tmpHash);
     }
 }
 
