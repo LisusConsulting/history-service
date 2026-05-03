@@ -152,6 +152,16 @@ builder.Services.Configure<DailyOptionsFlowRefreshOptions>(
     builder.Configuration.GetSection(DailyOptionsFlowRefreshOptions.SectionName));
 builder.Services.AddHostedService<DailyOptionsFlowRefreshService>();
 
+// --- Live-capture cron (Wave B / PR 4 of the ATM-IV plan) ---------------
+// Captures Polygon /v3/snapshot/options/{underlying} every 5 min during
+// RTH for ATM±5% × 0-60 DTE contracts and persists with
+// source='polygon_live' to historical_options_snapshots. Deploys with
+// the master enable flag OFF per plan brief — operator flips ON
+// post-bootstrap (Wave C / PR 9). Bind from History:LiveSnapshotCapture.
+builder.Services.Configure<LiveOptionsSnapshotCaptureOptions>(
+    builder.Configuration.GetSection(LiveOptionsSnapshotCaptureOptions.SectionName));
+builder.Services.AddHostedService<LiveOptionsSnapshotCaptureService>();
+
 // --- Option chains (micro-PR #4) -----------------------------------------
 // PolygonOptions still binds the Polygon:* configuration section because
 // existing deploys + smoke tests reference it; the SDK ignores it (its
