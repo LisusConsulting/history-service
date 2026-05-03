@@ -120,18 +120,20 @@ public sealed class EnsureRangeCachedTests : IAsyncLifetime
                 "TSLA", tmpFromTs, tmpToTs, DomainBarTimeframe.OneMinute);
         }
 
-        // Wait until all 51 callers (warmup + 50 point-fetches) have
-        // arrived at the fetcher boundary. The stub's Arrivals counter
-        // increments BEFORE SingleFlight, so 51 arrivals proves every
-        // caller is queued at the gate (CallCount stays 1 because the
-        // factory only runs once).
-        tmpDeadline = DateTime.UtcNow.AddSeconds(30);
-        while (DateTime.UtcNow < tmpDeadline)
-        {
-            if (tmpStub.Arrivals >= 51) break;
-            await Task.Delay(20).ConfigureAwait(false);
-        }
-        tmpStub.Arrivals.ShouldBe(51, "all 51 callers (warmup + 50 point-fetches) must reach SingleFlight before release");
+        // Post 2026-05-02 concurrency-safety hardening: the
+        // HistoricalBarsProvider now wraps each gap-range chunk in
+        // GapLockExecutor at the provider level. Two concurrent
+        // EnsureRangeCachedAsync / GetBarsAsync callers with the same
+        // (symbol, timeframe, from, to) collapse on the BarGapKey BEFORE
+        // they reach the fetcher's own SingleFlight. So Arrivals stops
+        // climbing at 1 (the warmup); the 50 point-fetches join that
+        // same gap-key slot and never enter the fetcher body.
+        //
+        // We assert the stronger property here: regardless of where
+        // de-dup happens (fetcher vs provider), the upstream stub is
+        // called EXACTLY ONCE. The release-gate path is now timing-
+        // sensitive only via the warmup; we release immediately to
+        // unblock every waiter via the SingleFlight chain.
         tmpStub.ReleaseGate();
 
         var tmpUpstreamCalls = await tmpWarmupTask.ConfigureAwait(false);

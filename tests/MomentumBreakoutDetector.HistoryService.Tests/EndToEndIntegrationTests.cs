@@ -210,19 +210,23 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
             .Select(_ => tmpHarness.Service.GetBars(tmpReq, NewServerCallContext()))
             .ToArray();
 
-        // Poll until all 50 callers have arrived at the fetcher's
-        // SingleFlight (Arrivals counts every entry pre-coalesce).
-        // CallCount stays at 1 because they all share the same gated
-        // factory invocation. Polling beats a fixed Task.Delay because
-        // gap-detection postgres queries can take seconds on slow CI.
+        // Post 2026-05-02 concurrency-safety hardening: the
+        // HistoricalBarsProvider now wraps each gap-range chunk in a
+        // GapLockExecutor at the provider level. Concurrent identical
+        // (symbol, timeframe, from, to) callers collapse on the
+        // BarGapKey BEFORE they reach the fetcher's SingleFlight, so
+        // BarFetcher.Arrivals tops out at 1 (the SF winner inside the
+        // provider) instead of 50. The functional invariant ("exactly
+        // one upstream call") is asserted below; we just need to wait
+        // for at least one arrival before releasing the gate.
         var tmpDeadline = DateTime.UtcNow.AddSeconds(30);
         while (DateTime.UtcNow < tmpDeadline)
         {
-            if (tmpHarness.BarFetcher.Arrivals >= 50) break;
+            if (tmpHarness.BarFetcher.Arrivals >= 1) break;
             await Task.Delay(20);
         }
-        tmpHarness.BarFetcher.Arrivals.ShouldBe(50,
-            "all 50 concurrent callers must reach the fetcher boundary before release");
+        tmpHarness.BarFetcher.Arrivals.ShouldBeGreaterThanOrEqualTo(1,
+            "the provider-level GapLockExecutor winner must reach the fetcher before release");
 
         tmpHarness.BarFetcher.ReleaseGate();
         await Task.WhenAll(tmpTasks);

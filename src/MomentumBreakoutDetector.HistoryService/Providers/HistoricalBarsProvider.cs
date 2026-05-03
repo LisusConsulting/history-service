@@ -1,6 +1,7 @@
 using Dapper;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using MomentumBreakoutDetector.HistoryService.Concurrency;
 using MomentumBreakoutDetector.HistoryService.Domain;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
 using MomentumBreakoutDetector.HistoryService.Observability;
@@ -79,12 +80,25 @@ public sealed record BarsReadResult(
     IReadOnlyList<Bar> Bars,
     bool CacheHit);
 
+/// <summary>
+/// Gap-range identity for the bars cache. Two concurrent
+/// <see cref="HistoricalBarsProvider.EnsureRangeCachedAsync"/> callers
+/// that compute overlapping fetch chunks will collapse on the same
+/// <see cref="BarGapKey"/> via the <see cref="GapLockExecutor{TKey}"/>;
+/// the second caller awaits the first's persist instead of re-fetching
+/// + racing the INSERT. Record-equality + immutability give us the
+/// hash/equality semantics SingleFlight expects.
+/// </summary>
+internal sealed record BarGapKey(
+    string Symbol, string Timeframe, DateTime FromUtc, DateTime ToUtc);
+
 public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
 {
     private readonly string m_ConnectionString;
     private readonly ILogger<HistoricalBarsProvider> m_Logger;
     private readonly IPolygonBarFetcher m_BarFetcher;
     private readonly MetricsCollector? m_Metrics;
+    private readonly GapLockExecutor<BarGapKey> m_GapLock = new();
 
     /// <summary>
     /// Hard ceiling on the per-call Polygon /v2/aggs window in days.
@@ -375,16 +389,65 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
             }
         }
 
+        // Per-chunk fetch+persist is wrapped in GapLockExecutor so two
+        // concurrent EnsureRangeCachedAsync callers whose gap-detection
+        // produced overlapping chunks collapse on the chunk's BarGapKey:
+        // exactly one caller fetches + upserts; the other awaits and
+        // re-reads the warm cache. Cross-replica safety comes from the
+        // short pg_advisory_xact_lock taken inside the persist path
+        // (see UpsertBarsLockedAsync below) — Polygon HTTP RTT is NOT
+        // held under the lock.
         var tmpUpstreamCalls = 0;
         var tmpEmptyChunks = new List<(DateTime From, DateTime To)>();
         for (var tmpIdx = 0; tmpIdx < tmpChunks.Count; tmpIdx++)
         {
             var (tmpChunkFrom, tmpChunkTo) = tmpChunks[tmpIdx];
-            tmpUpstreamCalls++;
-            var tmpFetched = await m_BarFetcher.FetchBarsAsync(
-                inSymbol, tmpChunkFrom, tmpChunkTo, inTimeframe, inCt);
+            var tmpKey = new BarGapKey(
+                inSymbol, tmpTimeframeStr,
+                DateTime.SpecifyKind(tmpChunkFrom, DateTimeKind.Utc),
+                DateTime.SpecifyKind(tmpChunkTo, DateTimeKind.Utc));
 
-            if (tmpFetched.Count == 0)
+            var tmpChunkBarsCount = 0;
+            var tmpChunkEmpty = false;
+            var tmpRanHere = await m_GapLock.ExecuteFetchAndPersistAsync(
+                tmpKey,
+                async () =>
+                {
+                    Interlocked.Increment(ref tmpUpstreamCalls);
+                    var tmpFetched = await m_BarFetcher.FetchBarsAsync(
+                        inSymbol, tmpChunkFrom, tmpChunkTo, inTimeframe, inCt)
+                        .ConfigureAwait(false);
+
+                    if (tmpFetched.Count == 0)
+                    {
+                        tmpChunkEmpty = true;
+                        return;
+                    }
+
+                    // Persist the fetched chunk inside a short
+                    // advisory-lock-protected transaction. The lock keys
+                    // on (table, gap-range) so a second history-service
+                    // replica racing on the same chunk serialises here
+                    // — first replica's INSERTs commit, second replica
+                    // hits ON CONFLICT DO NOTHING.
+                    await using var tmpPersistConn = new NpgsqlConnection(m_ConnectionString);
+                    await tmpPersistConn.OpenAsync(inCt).ConfigureAwait(false);
+                    await GapLockExecutor<BarGapKey>.WithPersistLockAsync(
+                        tmpPersistConn,
+                        inLockNamespace: "historical_bars",
+                        inLockKeySeed: BuildBarGapKeySeed(tmpKey),
+                        inWork: async (inLockedConn, inLockedTx, inLockCt) =>
+                        {
+                            await UpsertBarsAsync(
+                                inLockedConn, inSymbol, tmpTimeframeStr,
+                                tmpFetched, inLockCt, inLockedTx).ConfigureAwait(false);
+                        },
+                        inCt: inCt).ConfigureAwait(false);
+
+                    tmpChunkBarsCount = tmpFetched.Count;
+                }).ConfigureAwait(false);
+
+            if (tmpChunkEmpty)
             {
                 tmpEmptyChunks.Add((tmpChunkFrom, tmpChunkTo));
                 if (inProgress is not null)
@@ -396,13 +459,15 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
                 continue;
             }
 
-            await UpsertBarsAsync(tmpConn, inSymbol, tmpTimeframeStr, tmpFetched, inCt);
             if (inProgress is not null)
             {
                 await inProgress(new BarsWarmupProgress(
                     inSymbol, inTimeframe, tmpIdx + 1, tmpChunks.Count,
-                    BarsFetched: tmpFetched.Count, IsMissChunk: false), inCt);
+                    BarsFetched: tmpChunkBarsCount, IsMissChunk: false), inCt);
             }
+            // tmpRanHere is unused at present — captured for symmetry with
+            // future "did this caller actually invoke the upstream" metrics.
+            _ = tmpRanHere;
         }
 
         // 7. After fetching: any chunk whose response was empty AND whose
@@ -614,9 +679,18 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
         }
     }
 
+    /// <summary>
+    /// Build a stable advisory-lock seed string for a bar gap key. Uses
+    /// invariant ISO-8601 round-trip ("o") timestamp formatting so two
+    /// replicas across different host locales hash identically.
+    /// </summary>
+    internal static string BuildBarGapKeySeed(BarGapKey inKey)
+        => $"{inKey.Symbol}|{inKey.Timeframe}|{inKey.FromUtc:O}|{inKey.ToUtc:O}";
+
     private async Task UpsertBarsAsync(
         NpgsqlConnection inConn, string inSymbol, string inTimeframe,
-        IReadOnlyList<Bar> inBars, CancellationToken inCt)
+        IReadOnlyList<Bar> inBars, CancellationToken inCt,
+        NpgsqlTransaction? inTx = null)
     {
         if (inBars.Count == 0) return;
         // Per-row INSERT ... ON CONFLICT DO NOTHING. The (symbol,
@@ -625,6 +699,12 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
         // WriteMinuteBarAsync — that's tuned for live IEX-vs-REST
         // overlap. On-demand backfill always writes consolidated REST,
         // so DO NOTHING is the safer choice.
+        //
+        // Concurrency: the caller may have the connection participating in
+        // an outer pg_advisory_xact_lock-protected transaction (the new
+        // gap-lock path). Pass <paramref name="inTx"/> through so Dapper
+        // joins that transaction rather than auto-committing each INSERT
+        // outside it.
         foreach (var tmpBar in inBars)
         {
             await inConn.ExecuteAsync(
@@ -646,7 +726,8 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
                     Close = tmpBar.Close,
                     Volume = tmpBar.Volume,
                     Vwap = (object?)(tmpBar.VWAP > 0m ? tmpBar.VWAP : (decimal?)null) ?? DBNull.Value,
-                });
+                },
+                transaction: inTx);
         }
         m_Logger.LogInformation(
             "On-demand fill: upserted {Count} {Timeframe} bars for {Symbol}",
