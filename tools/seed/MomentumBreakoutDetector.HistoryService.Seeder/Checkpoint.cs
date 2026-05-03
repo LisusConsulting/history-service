@@ -20,6 +20,18 @@ public sealed class Checkpoint
     public string Symbol { get; set; } = "";
 
     /// <summary>
+    /// Surface the checkpoint was written for (PR 2). Defaults to
+    /// <see cref="Surface.Bars"/> for backward compatibility with
+    /// pre-PR-2 checkpoint files that omit the field. A run with a
+    /// different surface than the existing checkpoint is rejected at
+    /// load time (same shape as the symbol-mismatch guard) so an
+    /// operator does not accidentally crash a daily-flow run on top of
+    /// a bars checkpoint.
+    /// </summary>
+    [JsonPropertyName("surface")]
+    public Surface Surface { get; set; } = Surface.Bars;
+
+    /// <summary>
     /// Last fully-completed trading day. <c>null</c> for a fresh checkpoint.
     /// On resume, the seeder skips all dates &lt;= this value.
     /// </summary>
@@ -45,12 +57,26 @@ public sealed class Checkpoint
     };
 
     public static async Task<Checkpoint> LoadOrCreateAsync(string inPath, string inSymbol, CancellationToken inCt)
+        => await LoadOrCreateAsync(inPath, inSymbol, Surface.Bars, inCt).ConfigureAwait(false);
+
+    /// <summary>
+    /// Surface-aware overload (PR 2). A new run with a different
+    /// <paramref name="inSurface"/> than the existing checkpoint is rejected
+    /// — the per-day progress is not interchangeable across surfaces (a
+    /// "completed day" for the bars surface means NBBO for that day's RTH
+    /// minutes was fetched; for daily-flow it means the (symbol, day)
+    /// aggregated row was UPSERTed). Use a different
+    /// <c>--checkpoint-file</c> when switching surfaces.
+    /// </summary>
+    public static async Task<Checkpoint> LoadOrCreateAsync(
+        string inPath, string inSymbol, Surface inSurface, CancellationToken inCt)
     {
         if (!File.Exists(inPath))
         {
             return new Checkpoint
             {
                 Symbol = inSymbol,
+                Surface = inSurface,
                 StartedAtUtc = DateTime.UtcNow,
                 UpdatedAtUtc = DateTime.UtcNow,
             };
@@ -65,6 +91,13 @@ public sealed class Checkpoint
             throw new InvalidOperationException(
                 $"checkpoint symbol '{tmpCp.Symbol}' does not match requested symbol '{inSymbol}'. " +
                 "Use a different --checkpoint-file or remove the existing one to start fresh.");
+        }
+
+        if (tmpCp.Surface != inSurface)
+        {
+            throw new InvalidOperationException(
+                $"checkpoint surface '{tmpCp.Surface}' does not match requested surface '{inSurface}'. " +
+                "Use a different --checkpoint-file when switching surfaces (per-day progress is not interchangeable).");
         }
 
         return tmpCp;

@@ -802,6 +802,12 @@ public sealed class PastOnlyRangeValidationTests
             return Task.FromResult<IReadOnlyList<ProviderDailyOptionsFlowRow>>(
                 Array.Empty<ProviderDailyOptionsFlowRow>());
         }
+        // PR 2 — write surface. Read-path tests don't exercise it; both
+        // methods are no-ops here.
+        public Task UpsertAsync(IReadOnlyList<ProviderDailyOptionsFlowRow> inRows, CancellationToken inCt = default)
+            => Task.CompletedTask;
+        public Task RecordMissAsync(string inSymbol, DateOnly inFromDate, DateOnly inToDate, string inReason, CancellationToken inCt = default)
+            => Task.CompletedTask;
     }
 
     private sealed class ThrowingDailyOptionsFlowProvider : IDailyOptionsFlowProvider
@@ -814,6 +820,12 @@ public sealed class PastOnlyRangeValidationTests
             throw new InvalidOperationException(
                 "DailyOptionsFlow provider must not be invoked when validation rejects.");
         }
+        // PR 2 — write surface. Validation rejects before write; throw if
+        // anyone reaches these methods to surface the bug.
+        public Task UpsertAsync(IReadOnlyList<ProviderDailyOptionsFlowRow> inRows, CancellationToken inCt = default)
+            => throw new InvalidOperationException("UpsertAsync must not be invoked when validation rejects.");
+        public Task RecordMissAsync(string inSymbol, DateOnly inFromDate, DateOnly inToDate, string inReason, CancellationToken inCt = default)
+            => throw new InvalidOperationException("RecordMissAsync must not be invoked when validation rejects.");
     }
 
     private sealed class ThrowingMacroProvider : IMacroDataProvider
