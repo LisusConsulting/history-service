@@ -53,5 +53,9 @@
     <PackageVersion Include="Shouldly" Version="4.3.0" />
     <PackageVersion Include="Testcontainers" Version="4.7.0" />
     <PackageVersion Include="Testcontainers.PostgreSql" Version="4.7.0" />
+    <!-- PR 3 — FakeTimeProvider for the daily-flow refresh cron test. Same
+         major as Microsoft.Extensions.* (10.x) so the BCL TimeProvider
+         abstraction it implements is binary-compatible. -->
+    <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="9.10.0" />
   </ItemGroup>
 </Project>

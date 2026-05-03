@@ -10,6 +10,7 @@ using Alpaca.Markets;
 using Microsoft.Extensions.Options;
 using MomentumBreakoutDetector.HistoryService;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
+using MomentumBreakoutDetector.HistoryService.HostedServices;
 using MomentumBreakoutDetector.HistoryService.MessageHandlers;
 using MomentumBreakoutDetector.HistoryService.Observability;
 using MomentumBreakoutDetector.HistoryService.Providers;
@@ -107,12 +108,34 @@ builder.Services.AddScoped<IMacroDataProvider>(sp =>
     return new MacroDataProvider(opts.ConnectionString, logger, fred, metrics);
 });
 
-// --- Daily options flow (PR 1, daily_options_flow surface) --------------
-// Read-only at PR 1. Write path lands in PR 2 (backfill seeder mode) +
-// PR 3 (daily 08:00 ET cron). The provider is scoped because it only
-// touches Postgres and holds no per-request state — same scoping as the
-// other read-mostly providers.
+// --- Daily options flow (PRs 1, 2, 3, daily_options_flow surface) -------
+// PR 1 added the read provider; PR 2 added the write surface (UpsertAsync
+// + RecordMissAsync) used by the seeder; PR 3 adds the daily 08:00 ET
+// cron that maintains the trailing edge automatically. The provider is
+// scoped because it only touches Postgres and holds no per-request state
+// — same scoping as the other read-mostly providers.
 builder.Services.AddScoped<IDailyOptionsFlowProvider, DailyOptionsFlowProvider>();
+
+// PR 3 — per-day computer used by both the cron and (transitively) the
+// seeder via the same algorithm. Scoped because IOptionsService from the
+// SDK is registered transient — taking it scoped keeps the resolution
+// graph consistent.
+builder.Services.AddScoped<IDailyOptionsFlowComputer>(sp =>
+{
+    var tmpOpts = sp.GetRequiredService<IOptions<HistoryServiceOptions>>().Value;
+    var tmpPolygon = sp.GetRequiredService<TreyThomasCodes.Polygon.RestClient.Services.IOptionsService>();
+    var tmpLogger = sp.GetRequiredService<ILogger<DailyOptionsFlowComputer>>();
+    return new DailyOptionsFlowComputer(tmpOpts.ConnectionString, tmpPolygon, tmpLogger);
+});
+
+// PR 3 — TimeProvider injection so the cron can be unit-tested with
+// FakeTimeProvider. .NET 8+ has a built-in TimeProvider.System singleton.
+builder.Services.AddSingleton(TimeProvider.System);
+
+// PR 3 — daily refresh cron. Bind options from History:DailyFlowRefresh.
+builder.Services.Configure<DailyOptionsFlowRefreshOptions>(
+    builder.Configuration.GetSection(DailyOptionsFlowRefreshOptions.SectionName));
+builder.Services.AddHostedService<DailyOptionsFlowRefreshService>();
 
 // --- Option chains (micro-PR #4) -----------------------------------------
 // PolygonOptions still binds the Polygon:* configuration section because
