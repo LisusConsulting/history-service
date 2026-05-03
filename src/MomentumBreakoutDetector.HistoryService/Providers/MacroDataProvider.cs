@@ -92,8 +92,13 @@ public sealed class MacroDataProvider : IMacroDataProvider
     /// Aligned with MBD's <c>MacroDataRefreshService.FRED_SERIES</c>:
     /// T10Y2Y feeds the yield-curve sub-factor; CPIAUCSL + UNRATE are
     /// macro-context inputs the live engine surfaces in the explain
-    /// endpoint. Keep this map in sync with the live refresh service if
-    /// you add a series.
+    /// endpoint; DGS3MO (3-month T-bill yield) is the risk-free rate
+    /// input for the Black-Scholes IV solver added in Wave A / PR 2 of
+    /// the ATM-IV full historical coverage plan
+    /// (docs/research/atm-iv-full-historical-coverage-plan-2026-05-03.md).
+    /// FRED publishes DGS3MO Mon-Fri (excluding federal holidays);
+    /// "Daily" cadence is the correct gap-detection model. Keep this
+    /// map in sync with the live refresh service if you add a series.
     /// </summary>
     public static readonly IReadOnlyDictionary<string, FredSeriesCadence> KnownSeriesCadence =
         new Dictionary<string, FredSeriesCadence>(StringComparer.OrdinalIgnoreCase)
@@ -101,6 +106,7 @@ public sealed class MacroDataProvider : IMacroDataProvider
             ["T10Y2Y"] = FredSeriesCadence.Daily,
             ["CPIAUCSL"] = FredSeriesCadence.Monthly,
             ["UNRATE"] = FredSeriesCadence.Monthly,
+            ["DGS3MO"] = FredSeriesCadence.Daily,
         };
 
     public MacroDataProvider(

@@ -32,3 +32,12 @@
 -- on existing volumes the operator runs this migration once to create
 -- the new tables (idempotent — every CREATE is IF NOT EXISTS).
 \i /docker-entrypoint-initdb.d/migrations/012-daily-options-flow.sql
+-- 013 + 014 — Wave A / PR 1 of the ATM-IV full historical coverage plan
+-- (docs/research/atm-iv-full-historical-coverage-plan-2026-05-03.md):
+-- creates historical_options_snapshots + daily_atm_iv (+ both *_misses
+-- tables). Idempotent so an accidental re-run on a non-empty volume is
+-- harmless. On existing volumes the operator runs these migrations
+-- manually before the live-capture cron (PR 4) and seeder backfill
+-- (PR 3) deploy.
+\i /docker-entrypoint-initdb.d/migrations/013-historical-options-snapshots.sql
+\i /docker-entrypoint-initdb.d/migrations/014-daily-atm-iv.sql
