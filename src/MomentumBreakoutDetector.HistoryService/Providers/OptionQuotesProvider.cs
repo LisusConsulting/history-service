@@ -1,6 +1,7 @@
 using Dapper;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using MomentumBreakoutDetector.HistoryService.Concurrency;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
 using MomentumBreakoutDetector.HistoryService.Observability;
 using Npgsql;
@@ -30,6 +31,18 @@ namespace MomentumBreakoutDetector.HistoryService.Providers;
 ///     gRPC call. The fetcher + memory cache are singletons.
 /// </para>
 /// </summary>
+/// <summary>
+/// Per-quote gap key for NBBO. Two concurrent
+/// <see cref="OptionQuotesProvider.GetAtOrBeforeAsync"/> callers asking
+/// for the same (ticker, ts) collapse on this key — only one issues the
+/// Polygon /v3/quotes call + write-through. The other awaits and reads
+/// from the now-warm cache (in-memory or postgres). Without this, the
+/// in-memory layer + postgres ON CONFLICT DO NOTHING handle correctness,
+/// but Polygon would receive N duplicate calls during a backtest cold-
+/// start burst.
+/// </summary>
+internal sealed record NbboGapKey(string Ticker, DateTime TsUtc);
+
 public sealed class OptionQuotesProvider : IOptionQuotesProvider
 {
     public const int DefaultStaleQuoteToleranceSeconds = 300;
@@ -40,6 +53,7 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
     private readonly string m_ConnectionString;
     private readonly int m_StaleQuoteToleranceSeconds;
     private readonly MetricsCollector? m_Metrics;
+    private readonly GapLockExecutor<NbboGapKey> m_GapLock = new();
 
     public OptionQuotesProvider(
         NbboMemoryCache inMemCache,
@@ -66,6 +80,93 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
     {
         m_Metrics?.RecordRequest(MetricKind.Nbbo);
 
+        // Cache-first pre-check (in-memory hit, in-memory miss, postgres
+        // strict + fuzzy, postgres miss-marker). Returns early if any of
+        // these resolve. Only on a full miss do we enter the GapLockExecutor
+        // body below to fan one Polygon call across N concurrent waiters.
+        var tmpEarly = await TryServeFromCacheAsync(inTicker, inTsUtc, inCt).ConfigureAwait(false);
+        if (tmpEarly is not null) return tmpEarly;
+
+        // Polygon fetch + write-through under GapLockExecutor. Two
+        // concurrent callers asking for the same (ticker, ts) collapse:
+        // only one calls Polygon; the other awaits and re-reads the
+        // warmed memory/postgres cache.
+        OptionQuotesLookup? tmpResult = null;
+        var tmpKey = new NbboGapKey(
+            inTicker, DateTime.SpecifyKind(inTsUtc, DateTimeKind.Utc));
+        await m_GapLock.ExecuteFetchAndPersistAsync(tmpKey, async () =>
+        {
+            // Re-check the cache under the SingleFlight slot. A previous
+            // winner may have warmed mem-cache between the early read and
+            // this body. Without the re-check, two adjacent burst-callers
+            // would both fetch.
+            var tmpRecheck = await TryServeFromCacheAsync(inTicker, inTsUtc, inCt)
+                .ConfigureAwait(false);
+            if (tmpRecheck is not null)
+            {
+                tmpResult = tmpRecheck;
+                return;
+            }
+
+            var tmpFetch = await m_Fetcher.FetchAsync(inTicker, inTsUtc, inCt)
+                .ConfigureAwait(false);
+            switch (tmpFetch.Outcome)
+            {
+                case PolygonNbboOutcome.Hit when tmpFetch.Quote is not null:
+                {
+                    var tmpRec = ToRecord(tmpFetch.Quote);
+                    await CacheAsync(tmpRec, inCt).ConfigureAwait(false);
+                    m_MemCache.PutHit(tmpRec);
+                    tmpResult = new OptionQuotesLookup(
+                        tmpRec, CacheHit: false, IsMissMarker: false);
+                    return;
+                }
+                case PolygonNbboOutcome.Miss:
+                {
+                    await RecordMissAsync(
+                        inTicker, inTsUtc, tmpFetch.MissReason ?? "miss", inCt)
+                        .ConfigureAwait(false);
+                    m_MemCache.PutMiss(inTicker, inTsUtc);
+                    m_Metrics?.RecordMissMarker(MetricKind.Nbbo);
+                    tmpResult = new OptionQuotesLookup(
+                        null, CacheHit: false, IsMissMarker: true);
+                    return;
+                }
+                case PolygonNbboOutcome.Transient:
+                default:
+                {
+                    // Don't poison the cache. Caller may retry on the next
+                    // call. Returning null here propagates as Transient
+                    // through the SF result.
+                    tmpResult = new OptionQuotesLookup(
+                        null, CacheHit: false, IsMissMarker: false);
+                    return;
+                }
+            }
+        }).ConfigureAwait(false);
+
+        // Late joiners on the same SingleFlight slot did not run the
+        // body; they must read the warmed cache themselves.
+        if (tmpResult is null)
+        {
+            var tmpAfterFlight = await TryServeFromCacheAsync(inTicker, inTsUtc, inCt)
+                .ConfigureAwait(false);
+            return tmpAfterFlight
+                ?? new OptionQuotesLookup(null, CacheHit: false, IsMissMarker: false);
+        }
+        return tmpResult;
+    }
+
+    /// <summary>
+    /// Cache-first probe. Returns <c>null</c> if no layer can serve the
+    /// request; otherwise returns the resolved <see cref="OptionQuotesLookup"/>.
+    /// Order: in-memory hit, in-memory miss, postgres strict, postgres
+    /// fuzzy at-or-before within freshness window, postgres miss-marker.
+    /// Mirror of the lookup waterfall described on the class doc.
+    /// </summary>
+    private async Task<OptionQuotesLookup?> TryServeFromCacheAsync(
+        string inTicker, DateTime inTsUtc, CancellationToken inCt)
+    {
         // 1) In-memory hit?
         if (m_MemCache.TryGetHit(inTicker, inTsUtc, out var tmpMemHit) && tmpMemHit is not null)
         {
@@ -97,32 +198,7 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
             return new OptionQuotesLookup(null, CacheHit: true, IsMissMarker: true);
         }
 
-        // 6) Polygon fetch + write-through.
-        var tmpFetch = await m_Fetcher.FetchAsync(inTicker, inTsUtc, inCt).ConfigureAwait(false);
-        switch (tmpFetch.Outcome)
-        {
-            case PolygonNbboOutcome.Hit when tmpFetch.Quote is not null:
-            {
-                var tmpRec = ToRecord(tmpFetch.Quote);
-                await CacheAsync(tmpRec, inCt).ConfigureAwait(false);
-                m_MemCache.PutHit(tmpRec);
-                return new OptionQuotesLookup(tmpRec, CacheHit: false, IsMissMarker: false);
-            }
-            case PolygonNbboOutcome.Miss:
-            {
-                await RecordMissAsync(inTicker, inTsUtc, tmpFetch.MissReason ?? "miss", inCt)
-                    .ConfigureAwait(false);
-                m_MemCache.PutMiss(inTicker, inTsUtc);
-                m_Metrics?.RecordMissMarker(MetricKind.Nbbo);
-                return new OptionQuotesLookup(null, CacheHit: false, IsMissMarker: true);
-            }
-            case PolygonNbboOutcome.Transient:
-            default:
-            {
-                // Don't poison the cache. Caller may retry on the next call.
-                return new OptionQuotesLookup(null, CacheHit: false, IsMissMarker: false);
-            }
-        }
+        return null;
     }
 
     // ── postgres reads ────────────────────────────────────────────────────

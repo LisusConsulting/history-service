@@ -1,4 +1,5 @@
 using Dapper;
+using MomentumBreakoutDetector.HistoryService.Concurrency;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
 using MomentumBreakoutDetector.HistoryService.Observability;
 using Npgsql;
@@ -68,12 +69,23 @@ public interface IMacroDataProvider
 /// existing markers).
 /// </para>
 /// </summary>
+/// <summary>
+/// Gap-range identity for the macro cache. Two concurrent
+/// <see cref="MacroDataProvider.EnsureRangeCachedAsync(string, DateOnly, DateOnly, CancellationToken)"/>
+/// callers requesting overlapping ranges for the same series collapse on
+/// this key via the <see cref="GapLockExecutor{TKey}"/>: only one runs the
+/// FRED fetch + persist; the other awaits and re-reads.
+/// </summary>
+internal sealed record MacroGapKey(
+    string SeriesId, DateOnly FromDate, DateOnly ToDate);
+
 public sealed class MacroDataProvider : IMacroDataProvider
 {
     private readonly string _connectionString;
     private readonly ILogger<MacroDataProvider> _logger;
     private readonly IFredFetcher? _fredFetcher;
     private readonly MetricsCollector? _metrics;
+    private readonly GapLockExecutor<MacroGapKey> _gapLock = new();
 
     /// <summary>
     /// FRED series the runtime depends on, with their published cadence.
@@ -111,13 +123,32 @@ public sealed class MacroDataProvider : IMacroDataProvider
     /// full-range fetch per series; warm cache short-circuits with no
     /// FRED calls.
     /// </summary>
-    public async Task EnsureRangeCachedAsync(
+    public Task EnsureRangeCachedAsync(
         string seriesId, DateOnly fromDate, DateOnly toDate,
         CancellationToken ct)
     {
         _metrics?.RecordRequest(MetricKind.Macro);
+        if (_fredFetcher is null) return Task.CompletedTask;
+        if (fromDate > toDate) return Task.CompletedTask;
+
+        // GapLockExecutor wraps the whole fetch+persist for this
+        // (seriesId, fromDate, toDate) gap. Two concurrent callers asking
+        // for the same series + overlapping windows collapse here: only
+        // one runs the FRED fetch + the marker write; the other awaits.
+        // The cross-replica advisory lock is taken inside the persist
+        // step (DoEnsureRangeCachedAsync writes data + markers under
+        // RangeMarkerWriter's own pg_advisory_xact_lock).
+        var tmpKey = new MacroGapKey(seriesId, fromDate, toDate);
+        return _gapLock.ExecuteFetchAndPersistAsync(
+            tmpKey,
+            () => DoEnsureRangeCachedAsync(seriesId, fromDate, toDate, ct));
+    }
+
+    private async Task DoEnsureRangeCachedAsync(
+        string seriesId, DateOnly fromDate, DateOnly toDate,
+        CancellationToken ct)
+    {
         if (_fredFetcher is null) return;
-        if (fromDate > toDate) return;
 
         if (!KnownSeriesCadence.TryGetValue(seriesId, out var cadence))
         {

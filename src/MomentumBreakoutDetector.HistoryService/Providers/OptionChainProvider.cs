@@ -1,6 +1,7 @@
 using Dapper;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using MomentumBreakoutDetector.HistoryService.Concurrency;
 using MomentumBreakoutDetector.HistoryService.Domain;
 using MomentumBreakoutDetector.HistoryService.Fetchers;
 using MomentumBreakoutDetector.HistoryService.Observability;
@@ -103,6 +104,14 @@ public interface IOptionChainProvider
 /// genuinely-empty contiguous day-range.
 /// </para>
 /// </summary>
+/// <summary>
+/// Per-day chain gap key. Used for both
+/// <see cref="OptionChainProvider.EnsureChainCachedAsync"/> (one day) and
+/// each iteration of the per-day loop inside
+/// <see cref="OptionChainProvider.EnsureRangeCachedAsync"/>.
+/// </summary>
+internal sealed record ChainGapKey(string Symbol, DateOnly AsOfDate);
+
 public sealed class OptionChainProvider : IOptionChainProvider
 {
   private readonly string m_ConnectionString;
@@ -110,13 +119,16 @@ public sealed class OptionChainProvider : IOptionChainProvider
   private readonly IPolygonChainFetcher m_ChainFetcher;
 
   /// <summary>
-  /// In-flight de-duplication: many concurrent requests on the same
-  /// (symbol, as_of) — typical at backtest cold-start — share a single
-  /// Polygon fetch. Keyed lock; subsequent callers await the same Task
-  /// and read from the now-warm DB.
+  /// In-flight de-duplication via the shared
+  /// <see cref="GapLockExecutor{TKey}"/> primitive. Many concurrent
+  /// requests on the same (symbol, as_of) — typical at backtest
+  /// cold-start — collapse on the same <see cref="ChainGapKey"/>: only
+  /// one Polygon fetch runs; the other callers await and re-read the
+  /// warmed DB. Replaces the bespoke Dictionary+lock used in MBD's
+  /// PostgresOptionContractPicker so all four providers share one
+  /// concurrency abstraction.
   /// </summary>
-  private readonly Dictionary<(string, DateOnly), Task> m_FetchInflight = new();
-  private readonly object m_FetchInflightLock = new();
+  private readonly GapLockExecutor<ChainGapKey> m_GapLock = new();
 
   private readonly MetricsCollector? m_Metrics;
 
@@ -212,39 +224,18 @@ public sealed class OptionChainProvider : IOptionChainProvider
 
   // ── on-demand chain fetch (lifted from MBD picker, PR #130) ──────────
 
-  public async Task EnsureChainCachedAsync(
+  public Task EnsureChainCachedAsync(
     string inSymbol, DateOnly inAsOfDate, CancellationToken inCt)
   {
-    var tmpKey = (inSymbol, inAsOfDate);
-
-    // In-flight de-dup. We hold the lock only long enough to claim or
-    // join the in-flight Task; the actual await happens outside the lock.
-    Task tmpTask;
-    lock (m_FetchInflightLock)
-    {
-      if (!m_FetchInflight.TryGetValue(tmpKey, out var tmpExisting))
-      {
-        tmpExisting = DoEnsureAsync(inSymbol, inAsOfDate, inCt);
-        m_FetchInflight[tmpKey] = tmpExisting;
-      }
-      tmpTask = tmpExisting;
-    }
-
-    try
-    {
-      await tmpTask;
-    }
-    finally
-    {
-      lock (m_FetchInflightLock)
-      {
-        if (m_FetchInflight.TryGetValue(tmpKey, out var tmpExisting)
-            && ReferenceEquals(tmpExisting, tmpTask))
-        {
-          m_FetchInflight.Remove(tmpKey);
-        }
-      }
-    }
+    // GapLockExecutor wraps the entire fetch+persist for this
+    // (symbol, as_of_date) gap. Identical-key concurrent callers
+    // collapse on the same SingleFlight slot; the persist step inside
+    // DoEnsureAsync runs ON CONFLICT DO NOTHING + RangeMarkerWriter
+    // with its own pg_advisory_xact_lock for cross-replica safety.
+    var tmpKey = new ChainGapKey(inSymbol, inAsOfDate);
+    return m_GapLock.ExecuteFetchAndPersistAsync(
+      tmpKey,
+      () => DoEnsureAsync(inSymbol, inAsOfDate, inCt));
   }
 
   /// <summary>
@@ -363,25 +354,42 @@ public sealed class OptionChainProvider : IOptionChainProvider
     //    contiguous gap-range, walk every trading day in the range and
     //    fetch. Track which days came back empty inside each range so
     //    we can mark contiguous empty runs as one row.
+    //
+    //    Each per-day fetch+persist runs through the shared
+    //    GapLockExecutor on (symbol, day) so two concurrent
+    //    EnsureRangeCachedAsync callers whose ranges overlap collapse
+    //    day-by-day where they share gaps.
     var tmpUpstreamCalls = 0;
-    var tmpEmptyDays = new List<DateOnly>();
+    var tmpEmptyDaysBag = new System.Collections.Concurrent.ConcurrentBag<DateOnly>();
     foreach (var tmpRange in tmpRanges)
     {
       foreach (var tmpDay in TradingCalendar.EnumerateTradingDays(tmpRange.From, tmpRange.To))
       {
-        tmpUpstreamCalls++;
-        var tmpFetched = await m_ChainFetcher.FetchChainAsync(inSymbol, tmpDay, inCt)
-          .ConfigureAwait(false);
-        if (tmpFetched.Count == 0)
-        {
-          tmpEmptyDays.Add(tmpDay);
-        }
-        else
-        {
-          await UpsertChainAsync(tmpConn, inSymbol, tmpDay, tmpFetched, inCt);
-        }
+        var tmpDayKey = new ChainGapKey(inSymbol, tmpDay);
+        await m_GapLock.ExecuteFetchAndPersistAsync(
+          tmpDayKey,
+          async () =>
+          {
+            Interlocked.Increment(ref tmpUpstreamCalls);
+            var tmpFetched = await m_ChainFetcher.FetchChainAsync(inSymbol, tmpDay, inCt)
+              .ConfigureAwait(false);
+            if (tmpFetched.Count == 0)
+            {
+              tmpEmptyDaysBag.Add(tmpDay);
+              return;
+            }
+            // Open a dedicated connection for the persist step. Holding
+            // tmpConn across the GapLockExecutor body would be safe
+            // (single thread per connection) but we keep the persist
+            // connection separate so a future async fan-out across days
+            // does not need to reason about connection sharing.
+            await using var tmpPersistConn = new NpgsqlConnection(m_ConnectionString);
+            await tmpPersistConn.OpenAsync(inCt).ConfigureAwait(false);
+            await UpsertChainAsync(tmpPersistConn, inSymbol, tmpDay, tmpFetched, inCt);
+          }).ConfigureAwait(false);
       }
     }
+    var tmpEmptyDays = tmpEmptyDaysBag.ToList();
 
     // 7. Re-coalesce the empty-day set across all ranges (safety net for
     //    a fetcher returning empty for some-but-not-all days inside one
