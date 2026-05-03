@@ -12,6 +12,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- PR 2 — expose internal helpers (DailyOptionsFlowSeederEngine.ComputeFlowScore,
+         AggregateVolumes, AggregatedFlow record) to the test assembly so the
+         seeder math can be pinned without standing up the full engine. -->
+    <InternalsVisibleTo Include="MomentumBreakoutDetector.HistoryService.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- TradingCalendar (Domain) lives in the main service project after
          the gap-detection rework. The seeder uses the same calendar to
          enumerate trading days + half-days. Keeping a single source of

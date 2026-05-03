@@ -33,6 +33,11 @@
          the same namespace, tripping CS0433. The Service project is the
          single source of truth for proto types in tests. -->
     <ProjectReference Include="..\..\src\MomentumBreakoutDetector.HistoryService\MomentumBreakoutDetector.HistoryService.csproj" />
+    <!-- PR 2 — DailyOptionsFlowSeederTests exercises DailyOptionsFlowSeederEngine
+         + SeedOptions + Surface enum + Checkpoint, which all live in the
+         seeder tooling project. The seeder project transitively references
+         the service project so this does not double-link proto types. -->
+    <ProjectReference Include="..\..\tools\seed\MomentumBreakoutDetector.HistoryService.Seeder\MomentumBreakoutDetector.HistoryService.Seeder.csproj" />
   </ItemGroup>
 
 </Project>
