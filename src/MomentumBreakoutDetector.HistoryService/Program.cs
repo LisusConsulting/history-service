@@ -132,6 +132,21 @@ builder.Services.AddScoped<IDailyOptionsFlowComputer>(sp =>
 // FakeTimeProvider. .NET 8+ has a built-in TimeProvider.System singleton.
 builder.Services.AddSingleton(TimeProvider.System);
 
+// --- Pricing / Black-Scholes IV solver (Wave A / PR 2 of the ATM-IV
+// full historical coverage plan) -----------------------------------------
+// Stateless solver — pure function of inputs — registered as Singleton.
+// Consumed by:
+//   * PR 3 — backfill seeder for the historical_options_snapshots
+//     surface (--surface options_snapshots --compute-method bs).
+//   * PR 4 — live-capture cron does NOT call the solver (Polygon
+//     supplies IV/greeks on /v3/snapshot/options); the solver is
+//     dormant on the live path.
+//   * PR 6 (Wave C) — daily aggregate cron invokes via the seeder
+//     mode --surface daily_atm_iv when reaggregating computed_bs rows.
+builder.Services.AddSingleton<
+    MomentumBreakoutDetector.HistoryService.Pricing.BlackScholes.IBlackScholesSolver,
+    MomentumBreakoutDetector.HistoryService.Pricing.BlackScholes.BlackScholesSolver>();
+
 // PR 3 — daily refresh cron. Bind options from History:DailyFlowRefresh.
 builder.Services.Configure<DailyOptionsFlowRefreshOptions>(
     builder.Configuration.GetSection(DailyOptionsFlowRefreshOptions.SectionName));
