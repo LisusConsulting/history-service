@@ -10,10 +10,10 @@ namespace MomentumBreakoutDetector.HistoryService.Tests;
 
 /// <summary>
 /// Wave C / PR 6 — integration tests for
-/// <see cref="DailyAtmIvAggregator"/>. Validates the DISTINCT-ON +
-/// strike-band + non-NULL-IV filter logic against a real Postgres
-/// hypertable (testcontainers, vanilla pg image — no Timescale needed
-/// since the aggregator is pure SQL).
+/// <see cref="DailyAtmIvAggregator"/>. Validates the JOIN +
+/// DISTINCT-ON + strike-band + non-NULL-IV filter logic against a real
+/// Postgres pair (snapshots + contracts) via testcontainers (vanilla
+/// pg image — no Timescale needed since the aggregator is pure SQL).
 /// </summary>
 public class DailyAtmIvAggregatorTests : IAsyncLifetime
 {
@@ -29,22 +29,36 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
         await _postgres.StartAsync();
         await using var tmpConn = new NpgsqlConnection(_postgres.GetConnectionString());
         await tmpConn.OpenAsync();
-        // Minimal historical_options_snapshots schema — only the columns
-        // the aggregator reads. Real prod table has more columns + a
-        // hypertable wrapper, but the aggregator's SQL is column-stable.
+        // Minimal schemas — only the columns the aggregator reads. Real
+        // prod tables have more columns + Timescale hypertable wrappers,
+        // but the aggregator's SQL is column-stable.
+        // Production schema: historical_options_snapshots (migration 013)
+        // does NOT have underlying_ticker or strike_price; those come
+        // from historical_options_contracts (migration 003) via JOIN on
+        // the option ticker.
         await tmpConn.ExecuteAsync("""
             CREATE TABLE IF NOT EXISTS historical_options_snapshots (
-              ticker             VARCHAR(40) NOT NULL,
+              ticker             VARCHAR(50) NOT NULL,
               snapshot_date      TIMESTAMPTZ NOT NULL,
-              underlying_ticker  VARCHAR(10),
-              strike_price       NUMERIC(12,4),
-              underlying_price   NUMERIC(12,4),
               implied_volatility NUMERIC(10,6),
+              underlying_price   NUMERIC(18,4),
               source             VARCHAR(20),
               PRIMARY KEY (ticker, snapshot_date)
             );
-            CREATE INDEX idx_hos_underlying_ts
-              ON historical_options_snapshots(underlying_ticker, snapshot_date DESC);
+            CREATE INDEX idx_hos_ticker_ts
+              ON historical_options_snapshots(ticker, snapshot_date DESC);
+
+            CREATE TABLE IF NOT EXISTS historical_options_contracts (
+              ticker            VARCHAR(50) NOT NULL,
+              underlying_ticker VARCHAR(10) NOT NULL,
+              as_of_date        DATE NOT NULL,
+              strike_price      NUMERIC(18,4),
+              contract_type     VARCHAR(10),
+              expiration_date   DATE,
+              PRIMARY KEY (as_of_date, ticker)
+            );
+            CREATE INDEX idx_hoc_ticker
+              ON historical_options_contracts(ticker, underlying_ticker);
             """);
     }
 
@@ -70,11 +84,15 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
         //   O:TSLA240705P00200000  EOD IV=0.60
         //   O:TSLA240705C00210000  EOD IV=0.55 (within 5% band: |210-200|/200=5%)
         // Expected: AVG = (0.50 + 0.60 + 0.55) / 3 = 0.55, count=3.
+        await SeedContractsAsync("TSLA",
+            ("O:TSLA240705C00200000", 200m),
+            ("O:TSLA240705P00200000", 200m),
+            ("O:TSLA240705C00210000", 210m));
         await SeedSnapshotsAsync(
-            ("O:TSLA240705C00200000", new DateTime(2024, 6, 3, 10, 0, 0, DateTimeKind.Utc), "TSLA", 200m, 200m, 0.40m),
-            ("O:TSLA240705C00200000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "TSLA", 200m, 200m, 0.50m),
-            ("O:TSLA240705P00200000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "TSLA", 200m, 200m, 0.60m),
-            ("O:TSLA240705C00210000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "TSLA", 210m, 200m, 0.55m));
+            ("O:TSLA240705C00200000", new DateTime(2024, 6, 3, 10, 0, 0, DateTimeKind.Utc), 200m, 0.40m),
+            ("O:TSLA240705C00200000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 200m, 0.50m),
+            ("O:TSLA240705P00200000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 200m, 0.60m),
+            ("O:TSLA240705C00210000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 200m, 0.55m));
 
         var tmpAgg = new DailyAtmIvAggregator(
             _postgres.GetConnectionString(),
@@ -95,10 +113,14 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
         // 90 → out-of-band (|−10|/100=10%) skipped.
         // 100 → in-band.
         // 110 → out-of-band skipped.
+        await SeedContractsAsync("T",
+            ("O:T240705C00090000", 90m),
+            ("O:T240705C00100000", 100m),
+            ("O:T240705C00110000", 110m));
         await SeedSnapshotsAsync(
-            ("O:T240705C00090000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "T", 90m, 100m, 0.30m),
-            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "T", 100m, 100m, 0.40m),
-            ("O:T240705C00110000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "T", 110m, 100m, 0.50m));
+            ("O:T240705C00090000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 100m, 0.30m),
+            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 100m, 0.40m),
+            ("O:T240705C00110000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 100m, 0.50m));
 
         var tmpAgg = new DailyAtmIvAggregator(
             _postgres.GetConnectionString(),
@@ -114,9 +136,12 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
     [Fact]
     public async Task AggregateAsync_SkipsNullIvRows()
     {
+        await SeedContractsAsync("T",
+            ("O:T240705C00100000", 100m),
+            ("O:T240705C00102000", 102m));
         await SeedSnapshotsAsync(
-            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "T", 100m, 100m, null),
-            ("O:T240705C00102000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "T", 102m, 100m, 0.42m));
+            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 100m, null),
+            ("O:T240705C00102000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 100m, 0.42m));
 
         var tmpAgg = new DailyAtmIvAggregator(
             _postgres.GetConnectionString(),
@@ -132,8 +157,9 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
     [Fact]
     public async Task AggregateAsync_OnlyNullIv_ReturnsNull()
     {
+        await SeedContractsAsync("T", ("O:T240705C00100000", 100m));
         await SeedSnapshotsAsync(
-            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "T", 100m, 100m, null));
+            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 100m, null));
 
         var tmpAgg = new DailyAtmIvAggregator(
             _postgres.GetConnectionString(),
@@ -148,12 +174,12 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
     public async Task AggregateAsync_DistinctOnPicksLatestSnapshotPerContract()
     {
         // Two intraday rows + one EOD row for the same contract. The
-        // DISTINCT ON ... ORDER BY snapshot_date DESC must pick 19:30
-        // (the EOD row).
+        // DISTINCT ON ... ORDER BY snapshot_date DESC must pick 19:30.
+        await SeedContractsAsync("T", ("O:T240705C00100000", 100m));
         await SeedSnapshotsAsync(
-            ("O:T240705C00100000", new DateTime(2024, 6, 3, 14, 0, 0, DateTimeKind.Utc), "T", 100m, 100m, 0.20m),
-            ("O:T240705C00100000", new DateTime(2024, 6, 3, 18, 0, 0, DateTimeKind.Utc), "T", 100m, 100m, 0.30m),
-            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "T", 100m, 100m, 0.45m));
+            ("O:T240705C00100000", new DateTime(2024, 6, 3, 14, 0, 0, DateTimeKind.Utc), 100m, 0.20m),
+            ("O:T240705C00100000", new DateTime(2024, 6, 3, 18, 0, 0, DateTimeKind.Utc), 100m, 0.30m),
+            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 100m, 0.45m));
 
         var tmpAgg = new DailyAtmIvAggregator(
             _postgres.GetConnectionString(),
@@ -163,18 +189,17 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
 
         tmpResult.ShouldNotBeNull();
         tmpResult!.ContractCount.ShouldBe(1);
-        // EOD row's IV = 0.45 — NOT 0.30 from the prior intraday row.
         tmpResult.AtmIv.ShouldBe(0.45m);
     }
 
     [Fact]
     public async Task AggregateRangeAsync_GroupsByDay()
     {
-        // 3 days, each with one in-band contract.
+        await SeedContractsAsync("T", ("O:T240705C00100000", 100m));
         await SeedSnapshotsAsync(
-            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), "T", 100m, 100m, 0.40m),
-            ("O:T240705C00100000", new DateTime(2024, 6, 4, 19, 30, 0, DateTimeKind.Utc), "T", 100m, 100m, 0.45m),
-            ("O:T240705C00100000", new DateTime(2024, 6, 5, 19, 30, 0, DateTimeKind.Utc), "T", 100m, 100m, 0.50m));
+            ("O:T240705C00100000", new DateTime(2024, 6, 3, 19, 30, 0, DateTimeKind.Utc), 100m, 0.40m),
+            ("O:T240705C00100000", new DateTime(2024, 6, 4, 19, 30, 0, DateTimeKind.Utc), 100m, 0.45m),
+            ("O:T240705C00100000", new DateTime(2024, 6, 5, 19, 30, 0, DateTimeKind.Utc), 100m, 0.50m));
 
         var tmpAgg = new DailyAtmIvAggregator(
             _postgres.GetConnectionString(),
@@ -192,8 +217,40 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
         tmpRows[2].AtmIv.ShouldBe(0.50m);
     }
 
+    /// <summary>
+    /// Seed historical_options_contracts. Each tuple = (option ticker,
+    /// strike). The contract universe is keyed on (as_of_date, ticker)
+    /// in production but the aggregator only joins on (ticker,
+    /// underlying_ticker) so a single placeholder as_of_date row per
+    /// contract is enough to satisfy the join.
+    /// </summary>
+    private async Task SeedContractsAsync(
+        string inUnderlying, params (string Ticker, decimal Strike)[] inRows)
+    {
+        await using var tmpConn = new NpgsqlConnection(_postgres.GetConnectionString());
+        await tmpConn.OpenAsync();
+        foreach (var tmpRow in inRows)
+        {
+            await tmpConn.ExecuteAsync(
+                """
+                INSERT INTO historical_options_contracts
+                  (ticker, underlying_ticker, as_of_date, strike_price, contract_type, expiration_date)
+                VALUES (@T, @U, @AsOf::date, @K, 'call', @Exp::date)
+                ON CONFLICT (as_of_date, ticker) DO NOTHING
+                """,
+                new
+                {
+                    T = tmpRow.Ticker,
+                    U = inUnderlying,
+                    AsOf = "2024-06-03",
+                    K = tmpRow.Strike,
+                    Exp = "2024-07-05",
+                });
+        }
+    }
+
     private async Task SeedSnapshotsAsync(
-        params (string Ticker, DateTime Ts, string Underlying, decimal Strike, decimal UnderlyingPrice, decimal? Iv)[] inRows)
+        params (string Ticker, DateTime Ts, decimal UnderlyingPrice, decimal? Iv)[] inRows)
     {
         await using var tmpConn = new NpgsqlConnection(_postgres.GetConnectionString());
         await tmpConn.OpenAsync();
@@ -202,16 +259,13 @@ public class DailyAtmIvAggregatorTests : IAsyncLifetime
             await tmpConn.ExecuteAsync(
                 """
                 INSERT INTO historical_options_snapshots
-                  (ticker, snapshot_date, underlying_ticker, strike_price, underlying_price,
-                   implied_volatility, source)
-                VALUES (@T, @Ts, @U, @K, @S, @Iv, 'computed_bs')
+                  (ticker, snapshot_date, underlying_price, implied_volatility, source)
+                VALUES (@T, @Ts, @S, @Iv, 'computed_bs')
                 """,
                 new
                 {
                     T = tmpRow.Ticker,
                     Ts = tmpRow.Ts,
-                    U = tmpRow.Underlying,
-                    K = tmpRow.Strike,
                     S = tmpRow.UnderlyingPrice,
                     Iv = (object?)tmpRow.Iv ?? DBNull.Value,
                 });

@@ -194,26 +194,29 @@ public sealed class DailyAtmIvAggregator : IDailyAtmIvAggregator
     }
 
     /// <summary>
-    /// Per-day aggregation. Filter logic:
-    ///   strike within ATM ± @Band of underlying_price (skips rows where
-    ///   underlying_price is NULL or 0), implied_volatility IS NOT NULL,
-    ///   and the (ticker, day) row is the EOD reading via DISTINCT ON.
-    ///   The outer SELECT averages IV + counts contributing contracts.
+    /// Per-day aggregation. <c>historical_options_snapshots</c> stores the
+    /// option ticker + underlying_price (no underlying_ticker column, no
+    /// strike_price column — see migration 013). The underlying-ticker
+    /// filter and the strike-band filter both come from
+    /// <c>historical_options_contracts</c> via a JOIN on the option
+    /// ticker. The DISTINCT ON picks the EOD reading per contract.
     /// </summary>
     internal const string AggregateOneSql = """
         WITH eod_per_contract AS (
-            SELECT DISTINCT ON (ticker, date_trunc('day', snapshot_date))
-                ticker, snapshot_date, implied_volatility, strike_price, underlying_price
-            FROM historical_options_snapshots
-            WHERE underlying_ticker = @Symbol
-              AND snapshot_date >= @Date::date::timestamptz
-              AND snapshot_date <  (@Date::date + 1)::timestamptz
-              AND implied_volatility IS NOT NULL
-              AND strike_price IS NOT NULL
-              AND underlying_price IS NOT NULL
-              AND underlying_price > 0
-              AND ABS((strike_price - underlying_price) / underlying_price) <= @Band
-            ORDER BY ticker, date_trunc('day', snapshot_date), snapshot_date DESC
+            SELECT DISTINCT ON (s.ticker, date_trunc('day', s.snapshot_date))
+                s.ticker, s.snapshot_date, s.implied_volatility, s.underlying_price,
+                c.strike_price
+            FROM historical_options_snapshots s
+            JOIN historical_options_contracts c
+              ON c.ticker = s.ticker AND c.underlying_ticker = @Symbol
+            WHERE s.snapshot_date >= @Date::date::timestamptz
+              AND s.snapshot_date <  (@Date::date + 1)::timestamptz
+              AND s.implied_volatility IS NOT NULL
+              AND s.underlying_price IS NOT NULL
+              AND s.underlying_price > 0
+              AND c.strike_price IS NOT NULL
+              AND ABS((c.strike_price - s.underlying_price) / s.underlying_price) <= @Band
+            ORDER BY s.ticker, date_trunc('day', s.snapshot_date), s.snapshot_date DESC
         )
         SELECT
             AVG(implied_volatility) AS "AtmIv",
@@ -223,26 +226,26 @@ public sealed class DailyAtmIvAggregator : IDailyAtmIvAggregator
 
     /// <summary>
     /// Range aggregation (one row per non-empty trading day in [from, to]).
-    /// Same EOD-per-contract DISTINCT-ON logic as the per-day query, just
-    /// grouped by date. Empty days drop out of the result via the
-    /// HAVING clause.
+    /// Same JOIN + DISTINCT-ON logic, grouped by trade_date.
     /// </summary>
     internal const string AggregateRangeSql = """
         WITH eod_per_contract AS (
-            SELECT DISTINCT ON (ticker, date_trunc('day', snapshot_date))
-                ticker,
-                snapshot_date::date AS trade_date,
-                implied_volatility, strike_price, underlying_price
-            FROM historical_options_snapshots
-            WHERE underlying_ticker = @Symbol
-              AND snapshot_date >= @From::date::timestamptz
-              AND snapshot_date <  (@To::date + 1)::timestamptz
-              AND implied_volatility IS NOT NULL
-              AND strike_price IS NOT NULL
-              AND underlying_price IS NOT NULL
-              AND underlying_price > 0
-              AND ABS((strike_price - underlying_price) / underlying_price) <= @Band
-            ORDER BY ticker, date_trunc('day', snapshot_date), snapshot_date DESC
+            SELECT DISTINCT ON (s.ticker, date_trunc('day', s.snapshot_date))
+                s.ticker,
+                s.snapshot_date::date AS trade_date,
+                s.implied_volatility, s.underlying_price,
+                c.strike_price
+            FROM historical_options_snapshots s
+            JOIN historical_options_contracts c
+              ON c.ticker = s.ticker AND c.underlying_ticker = @Symbol
+            WHERE s.snapshot_date >= @From::date::timestamptz
+              AND s.snapshot_date <  (@To::date + 1)::timestamptz
+              AND s.implied_volatility IS NOT NULL
+              AND s.underlying_price IS NOT NULL
+              AND s.underlying_price > 0
+              AND c.strike_price IS NOT NULL
+              AND ABS((c.strike_price - s.underlying_price) / s.underlying_price) <= @Band
+            ORDER BY s.ticker, date_trunc('day', s.snapshot_date), s.snapshot_date DESC
         )
         SELECT
             trade_date::text AS "TradeDateText",
