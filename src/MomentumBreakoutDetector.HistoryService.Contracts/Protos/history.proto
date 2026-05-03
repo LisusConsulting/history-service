@@ -45,6 +45,12 @@ service HistoryService {
 
   // ---- Operability.
   rpc GetCacheStats (GetCacheStatsRequest) returns (GetCacheStatsResponse);
+
+  // ---- Daily options-flow read (PR 1, daily_options_flow surface).
+  // Past-only: rejects today-or-later via PastOnlyRangeValidator. The live
+  // engine never reads this table — it computes flow on-the-fly per signal
+  // cycle from the current chain. Backtests read past-day rows here.
+  rpc GetDailyOptionsFlow (GetDailyOptionsFlowRequest) returns (GetDailyOptionsFlowResponse);
 }
 
 // ----------------------------------------------------------------------------
@@ -244,4 +250,42 @@ message ClassStats {
 message GetCacheStatsResponse {
   repeated ClassStats class_stats = 1;
   google.protobuf.Timestamp as_of = 2;
+}
+
+// ----------------------------------------------------------------------------
+// GetDailyOptionsFlow — read aggregated put/call flow rows over [from, to].
+//
+// Server applies PastOnlyRangeValidator and returns NotFound-style empty
+// payload (rows: []) when the range has no rows. There is no upstream
+// fetch on miss — this surface is populated exclusively by the backfill
+// seeder + daily 08:00 ET cron in history-service. Consumers who need a
+// guaranteed-populated date range should run those tools first.
+// ----------------------------------------------------------------------------
+message GetDailyOptionsFlowRequest {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp from_date = 2;       // date — time component ignored
+  google.protobuf.Timestamp to_date = 3;         // date — time component ignored, inclusive
+}
+
+message DailyOptionsFlowRow {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp trade_date = 2;      // date — UTC midnight
+  int64 call_volume = 3;
+  int64 put_volume = 4;
+  int64 call_oi = 5;
+  int64 put_oi = 6;
+  // put_call_ratio / flow_score may be unset in the source row when
+  // call_side <= 0; absent here means SQL NULL (consumer should treat
+  // as "no flow signal for this day"). Booleans flag the absence
+  // explicitly so the wire payload doesn't conflate 0.0 with NULL.
+  double put_call_ratio = 7;
+  bool put_call_ratio_is_null = 8;
+  double flow_score = 9;
+  bool flow_score_is_null = 10;
+  int32 contract_count = 11;
+}
+
+message GetDailyOptionsFlowResponse {
+  repeated DailyOptionsFlowRow rows = 1;
+  bool cache_hit = 2;                            // always true — no upstream on miss
 }

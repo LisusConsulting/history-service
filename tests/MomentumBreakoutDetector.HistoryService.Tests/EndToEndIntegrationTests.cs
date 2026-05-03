@@ -479,7 +479,11 @@ public sealed class EndToEndIntegrationTests : IAsyncLifetime
             tmpQuotesProvider,
             tmpMacroProvider,
             tmpChainProvider,
-            inMetrics);
+            // dailyOptionsFlowProvider — null in this test (PR 1 added the
+            // parameter; integration tests that don't exercise the surface
+            // pass null to keep using the new parameter list cleanly).
+            dailyOptionsFlowProvider: null,
+            metrics: inMetrics);
 
         return new TestHarness(tmpService, tmpBarFetcher, tmpFred);
     }
