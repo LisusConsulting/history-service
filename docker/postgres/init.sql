@@ -27,3 +27,8 @@
 -- column is never created here), but we list it so the file order stays
 -- in sync with the migrations directory and the deployment plan.
 \i /docker-entrypoint-initdb.d/migrations/011-macro-misses-range-shape.sql
+-- 012 creates daily_options_flow + daily_options_flow_misses on fresh
+-- volumes so the backtest reader has the schema available immediately;
+-- on existing volumes the operator runs this migration once to create
+-- the new tables (idempotent — every CREATE is IF NOT EXISTS).
+\i /docker-entrypoint-initdb.d/migrations/012-daily-options-flow.sql

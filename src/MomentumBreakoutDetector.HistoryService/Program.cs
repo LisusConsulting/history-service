@@ -107,6 +107,13 @@ builder.Services.AddScoped<IMacroDataProvider>(sp =>
     return new MacroDataProvider(opts.ConnectionString, logger, fred, metrics);
 });
 
+// --- Daily options flow (PR 1, daily_options_flow surface) --------------
+// Read-only at PR 1. Write path lands in PR 2 (backfill seeder mode) +
+// PR 3 (daily 08:00 ET cron). The provider is scoped because it only
+// touches Postgres and holds no per-request state — same scoping as the
+// other read-mostly providers.
+builder.Services.AddScoped<IDailyOptionsFlowProvider, DailyOptionsFlowProvider>();
+
 // --- Option chains (micro-PR #4) -----------------------------------------
 // PolygonOptions still binds the Polygon:* configuration section because
 // existing deploys + smoke tests reference it; the SDK ignores it (its

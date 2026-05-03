@@ -7,6 +7,7 @@ using MomentumBreakoutDetector.HistoryService.Providers;
 using MomentumBreakoutDetector.HistoryService.Validation;
 using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTimeframe;
 using V1Bar = MomentumBreakoutDetector.HistoryService.Contracts.V1.Bar;
+using V1DailyOptionsFlowRow = MomentumBreakoutDetector.HistoryService.Contracts.V1.DailyOptionsFlowRow;
 
 namespace MomentumBreakoutDetector.HistoryService;
 
@@ -41,6 +42,10 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
     // provider. Nullable so that earlier-not-yet-merged PRs don't break
     // the DI graph; an absent provider falls through to Unimplemented.
     private readonly IOptionChainProvider? _optionChainProvider;
+    // PR 1 (daily_options_flow surface) — read-only provider for past-day
+    // backtest reads of aggregated put/call flow. Nullable for tests that
+    // omit DI; in production the scoped registration is always present.
+    private readonly IDailyOptionsFlowProvider? _dailyOptionsFlowProvider;
     // Phase 1 micro-PR #8 — observability surface. Nullable for tests
     // that bypass DI; in production the singleton is always registered.
     private readonly MetricsCollector? _metrics;
@@ -51,6 +56,7 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         IOptionQuotesProvider quotes,
         IMacroDataProvider? macroProvider = null,
         IOptionChainProvider? optionChainProvider = null,
+        IDailyOptionsFlowProvider? dailyOptionsFlowProvider = null,
         MetricsCollector? metrics = null)
     {
         _logger = logger;
@@ -58,6 +64,7 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         _quotes = quotes;
         _macroProvider = macroProvider;
         _optionChainProvider = optionChainProvider;
+        _dailyOptionsFlowProvider = dailyOptionsFlowProvider;
         _metrics = metrics;
     }
 
@@ -734,4 +741,86 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         MetricKind.Macro => DataClass.Macro,
         _ => DataClass.Unspecified,
     };
+
+    /// <summary>
+    /// PR 1 — read aggregated put/call flow rows over [from, to] for one
+    /// underlying. Past-only guard rejects today-or-later (consistent
+    /// with the Phase 1 contract: today's flow is computed in-engine
+    /// from the live chain, never read from this table). No upstream
+    /// fetch on miss — empty rows means the seeder / daily cron has not
+    /// populated this window yet.
+    /// </summary>
+    public override async Task<GetDailyOptionsFlowResponse> GetDailyOptionsFlow(
+        GetDailyOptionsFlowRequest request, ServerCallContext context)
+    {
+        if (_dailyOptionsFlowProvider is null)
+        {
+            // DI not wired — typical only in tests that intentionally
+            // omit the provider.
+            throw new RpcException(new Status(StatusCode.Unimplemented,
+                "Daily-options-flow provider is not registered."));
+        }
+        if (string.IsNullOrWhiteSpace(request.UnderlyingTicker))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "underlying_ticker is required."));
+        }
+        if (request.FromDate is null || request.ToDate is null)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "from_date and to_date are required."));
+        }
+
+        var tmpFromUtc = request.FromDate.ToDateTime();
+        var tmpToUtc = request.ToDate.ToDateTime();
+
+        if (tmpFromUtc > tmpToUtc)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "from_date must be <= to_date."));
+        }
+
+        // Past-only guard — same contract as the other 4 surfaces. The
+        // live engine computes today's flow on-the-fly from the current
+        // chain; this RPC must not serve today-or-later.
+        PastOnlyRangeValidator.EnsurePastOnly(tmpFromUtc, tmpToUtc);
+
+        var tmpFromDate = DateOnly.FromDateTime(tmpFromUtc);
+        var tmpToDate = DateOnly.FromDateTime(tmpToUtc);
+
+        _logger.LogInformation(
+            "GetDailyOptionsFlow underlying={Underlying} from={From} to={To}",
+            request.UnderlyingTicker, tmpFromDate, tmpToDate);
+
+        var tmpRows = await _dailyOptionsFlowProvider.GetRangeAsync(
+            request.UnderlyingTicker, tmpFromDate, tmpToDate, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        var tmpResp = new GetDailyOptionsFlowResponse
+        {
+            // Cache-only surface — there is no upstream fetch, so cache
+            // hit is true any time the read returned (matches the proto
+            // doc comment).
+            CacheHit = true,
+        };
+        foreach (var tmpRow in tmpRows)
+        {
+            tmpResp.Rows.Add(new V1DailyOptionsFlowRow
+            {
+                UnderlyingTicker = tmpRow.UnderlyingTicker,
+                TradeDate = Timestamp.FromDateTime(
+                    tmpRow.TradeDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc)),
+                CallVolume = tmpRow.CallVolume,
+                PutVolume = tmpRow.PutVolume,
+                CallOi = tmpRow.CallOi,
+                PutOi = tmpRow.PutOi,
+                PutCallRatio = tmpRow.PutCallRatio.HasValue ? (double)tmpRow.PutCallRatio.Value : 0d,
+                PutCallRatioIsNull = !tmpRow.PutCallRatio.HasValue,
+                FlowScore = tmpRow.FlowScore.HasValue ? (double)tmpRow.FlowScore.Value : 0d,
+                FlowScoreIsNull = !tmpRow.FlowScore.HasValue,
+                ContractCount = tmpRow.ContractCount,
+            });
+        }
+        return tmpResp;
+    }
 }

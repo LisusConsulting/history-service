@@ -9,6 +9,7 @@ using Shouldly;
 using Xunit;
 using DomainBar = MomentumBreakoutDetector.HistoryService.Domain.Bar;
 using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTimeframe;
+using ProviderDailyOptionsFlowRow = MomentumBreakoutDetector.HistoryService.Providers.DailyOptionsFlowRow;
 
 namespace MomentumBreakoutDetector.HistoryService.Tests;
 
@@ -382,6 +383,145 @@ public sealed class PastOnlyRangeValidationTests
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // GetDailyOptionsFlow (PR 1, daily_options_flow surface)
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetDailyOptionsFlow_AllPastRange_PassesValidationAndReachesProvider()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(-30);
+        var tmpToUtc = tmpBoundary.AddDays(-1);
+
+        var tmpFlow = new RecordingDailyOptionsFlowProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: tmpFlow);
+
+        var tmpRequest = new GetDailyOptionsFlowRequest
+        {
+            UnderlyingTicker = "TSLA",
+            FromDate = Timestamp.FromDateTime(tmpFromUtc),
+            ToDate = Timestamp.FromDateTime(tmpToUtc),
+        };
+
+        var tmpResp = await tmpImpl.GetDailyOptionsFlow(tmpRequest, NewServerCallContext());
+        tmpResp.ShouldNotBeNull();
+        tmpResp.CacheHit.ShouldBeTrue();
+        tmpResp.Rows.Count.ShouldBe(0);
+        tmpFlow.WasInvoked.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task GetDailyOptionsFlow_RangeEndingAtBoundary_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFlow = new ThrowingDailyOptionsFlowProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: tmpFlow);
+
+        var tmpRequest = new GetDailyOptionsFlowRequest
+        {
+            UnderlyingTicker = "TSLA",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-7)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetDailyOptionsFlow(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpFlow.WasInvoked.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetDailyOptionsFlow_RangeEntirelyInFuture_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFlow = new ThrowingDailyOptionsFlowProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: tmpFlow);
+
+        var tmpRequest = new GetDailyOptionsFlowRequest
+        {
+            UnderlyingTicker = "TSLA",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(1)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary.AddDays(7)),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetDailyOptionsFlow(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpFlow.WasInvoked.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetDailyOptionsFlow_StraddlingRange_IsRejected_NotSilentlyTruncated()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFlow = new ThrowingDailyOptionsFlowProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: tmpFlow);
+
+        var tmpRequest = new GetDailyOptionsFlowRequest
+        {
+            UnderlyingTicker = "TSLA",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-14)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary.AddDays(2)),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetDailyOptionsFlow(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpFlow.WasInvoked.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetDailyOptionsFlow_InvertedRange_RejectedAsInvalidArgument()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFlow = new ThrowingDailyOptionsFlowProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: tmpFlow);
+
+        var tmpRequest = new GetDailyOptionsFlowRequest
+        {
+            UnderlyingTicker = "TSLA",
+            // from > to → InvalidArgument BEFORE the past-only guard runs.
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-1)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-30)),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetDailyOptionsFlow(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.InvalidArgument);
+        tmpFlow.WasInvoked.ShouldBeFalse();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // Direct validator unit checks. Belt-and-braces — exercises the
     // helper without going through the gRPC surface.
     // ─────────────────────────────────────────────────────────────────
@@ -649,6 +789,30 @@ public sealed class PastOnlyRangeValidationTests
         {
             WasInvoked = true;
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class RecordingDailyOptionsFlowProvider : IDailyOptionsFlowProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<IReadOnlyList<ProviderDailyOptionsFlowRow>> GetRangeAsync(
+            string inSymbol, DateOnly inFrom, DateOnly inTo, CancellationToken inCt = default)
+        {
+            WasInvoked = true;
+            return Task.FromResult<IReadOnlyList<ProviderDailyOptionsFlowRow>>(
+                Array.Empty<ProviderDailyOptionsFlowRow>());
+        }
+    }
+
+    private sealed class ThrowingDailyOptionsFlowProvider : IDailyOptionsFlowProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<IReadOnlyList<ProviderDailyOptionsFlowRow>> GetRangeAsync(
+            string inSymbol, DateOnly inFrom, DateOnly inTo, CancellationToken inCt = default)
+        {
+            WasInvoked = true;
+            throw new InvalidOperationException(
+                "DailyOptionsFlow provider must not be invoked when validation rejects.");
         }
     }
 
