@@ -10,6 +10,7 @@ using Xunit;
 using DomainBar = MomentumBreakoutDetector.HistoryService.Domain.Bar;
 using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTimeframe;
 using ProviderDailyOptionsFlowRow = MomentumBreakoutDetector.HistoryService.Providers.DailyOptionsFlowRow;
+using ProviderDailyAtmIvRow = MomentumBreakoutDetector.HistoryService.Providers.DailyAtmIvRow;
 
 namespace MomentumBreakoutDetector.HistoryService.Tests;
 
@@ -522,6 +523,122 @@ public sealed class PastOnlyRangeValidationTests
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // GetDailyAtmIv (Wave B / PR 5, daily_atm_iv surface)
+    // ─────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task GetDailyAtmIv_AllPastRange_PassesValidationAndReachesProvider()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpFromUtc = tmpBoundary.AddDays(-30);
+        var tmpToUtc = tmpBoundary.AddDays(-1);
+
+        var tmpAtm = new RecordingDailyAtmIvProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: null,
+            dailyAtmIvProvider: tmpAtm);
+
+        var tmpRequest = new GetDailyAtmIvRequest
+        {
+            UnderlyingTicker = "TSLA",
+            FromDate = Timestamp.FromDateTime(tmpFromUtc),
+            ToDate = Timestamp.FromDateTime(tmpToUtc),
+        };
+
+        var tmpResp = await tmpImpl.GetDailyAtmIv(tmpRequest, NewServerCallContext());
+        tmpResp.ShouldNotBeNull();
+        tmpResp.CacheHit.ShouldBeTrue();
+        tmpResp.Rows.Count.ShouldBe(0);
+        tmpAtm.WasInvoked.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task GetDailyAtmIv_RangeEndingAtBoundary_IsRejected()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpAtm = new ThrowingDailyAtmIvProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: null,
+            dailyAtmIvProvider: tmpAtm);
+
+        var tmpRequest = new GetDailyAtmIvRequest
+        {
+            UnderlyingTicker = "TSLA",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-7)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetDailyAtmIv(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpAtm.WasInvoked.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetDailyAtmIv_StraddlingRange_IsRejected_NotSilentlyTruncated()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpAtm = new ThrowingDailyAtmIvProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: null,
+            dailyAtmIvProvider: tmpAtm);
+
+        var tmpRequest = new GetDailyAtmIvRequest
+        {
+            UnderlyingTicker = "TSLA",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-14)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary.AddDays(2)),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetDailyAtmIv(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        tmpAtm.WasInvoked.ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task GetDailyAtmIv_InvertedRange_RejectedAsInvalidArgument()
+    {
+        var tmpBoundary = TodayBoundaryUtc();
+        var tmpAtm = new ThrowingDailyAtmIvProvider();
+        var tmpImpl = new HistoryServiceImpl(
+            NullLogger<HistoryServiceImpl>.Instance,
+            new RecordingBarsProvider(),
+            quotes: new RecordingQuotesProvider(),
+            macroProvider: null,
+            optionChainProvider: null,
+            dailyOptionsFlowProvider: null,
+            dailyAtmIvProvider: tmpAtm);
+
+        var tmpRequest = new GetDailyAtmIvRequest
+        {
+            UnderlyingTicker = "TSLA",
+            FromDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-1)),
+            ToDate = Timestamp.FromDateTime(tmpBoundary.AddDays(-30)),
+        };
+
+        var tmpEx = await Should.ThrowAsync<RpcException>(
+            () => tmpImpl.GetDailyAtmIv(tmpRequest, NewServerCallContext()));
+        tmpEx.StatusCode.ShouldBe(StatusCode.InvalidArgument);
+        tmpAtm.WasInvoked.ShouldBeFalse();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // Direct validator unit checks. Belt-and-braces — exercises the
     // helper without going through the gRPC surface.
     // ─────────────────────────────────────────────────────────────────
@@ -823,6 +940,39 @@ public sealed class PastOnlyRangeValidationTests
         // PR 2 — write surface. Validation rejects before write; throw if
         // anyone reaches these methods to surface the bug.
         public Task UpsertAsync(IReadOnlyList<ProviderDailyOptionsFlowRow> inRows, CancellationToken inCt = default)
+            => throw new InvalidOperationException("UpsertAsync must not be invoked when validation rejects.");
+        public Task RecordMissAsync(string inSymbol, DateOnly inFromDate, DateOnly inToDate, string inReason, CancellationToken inCt = default)
+            => throw new InvalidOperationException("RecordMissAsync must not be invoked when validation rejects.");
+    }
+
+    private sealed class RecordingDailyAtmIvProvider : IDailyAtmIvProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<IReadOnlyList<ProviderDailyAtmIvRow>> GetRangeAsync(
+            string inSymbol, DateOnly inFrom, DateOnly inTo, CancellationToken inCt = default)
+        {
+            WasInvoked = true;
+            return Task.FromResult<IReadOnlyList<ProviderDailyAtmIvRow>>(
+                Array.Empty<ProviderDailyAtmIvRow>());
+        }
+        // Wave C / PR 6 — write surface. Read-path tests don't exercise it.
+        public Task UpsertAsync(IReadOnlyList<ProviderDailyAtmIvRow> inRows, CancellationToken inCt = default)
+            => Task.CompletedTask;
+        public Task RecordMissAsync(string inSymbol, DateOnly inFromDate, DateOnly inToDate, string inReason, CancellationToken inCt = default)
+            => Task.CompletedTask;
+    }
+
+    private sealed class ThrowingDailyAtmIvProvider : IDailyAtmIvProvider
+    {
+        public bool WasInvoked { get; private set; }
+        public Task<IReadOnlyList<ProviderDailyAtmIvRow>> GetRangeAsync(
+            string inSymbol, DateOnly inFrom, DateOnly inTo, CancellationToken inCt = default)
+        {
+            WasInvoked = true;
+            throw new InvalidOperationException(
+                "DailyAtmIv provider must not be invoked when validation rejects.");
+        }
+        public Task UpsertAsync(IReadOnlyList<ProviderDailyAtmIvRow> inRows, CancellationToken inCt = default)
             => throw new InvalidOperationException("UpsertAsync must not be invoked when validation rejects.");
         public Task RecordMissAsync(string inSymbol, DateOnly inFromDate, DateOnly inToDate, string inReason, CancellationToken inCt = default)
             => throw new InvalidOperationException("RecordMissAsync must not be invoked when validation rejects.");

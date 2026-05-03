@@ -8,6 +8,7 @@ using MomentumBreakoutDetector.HistoryService.Validation;
 using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTimeframe;
 using V1Bar = MomentumBreakoutDetector.HistoryService.Contracts.V1.Bar;
 using V1DailyOptionsFlowRow = MomentumBreakoutDetector.HistoryService.Contracts.V1.DailyOptionsFlowRow;
+using V1DailyAtmIvRow = MomentumBreakoutDetector.HistoryService.Contracts.V1.DailyAtmIvRow;
 
 namespace MomentumBreakoutDetector.HistoryService;
 
@@ -46,6 +47,10 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
     // backtest reads of aggregated put/call flow. Nullable for tests that
     // omit DI; in production the scoped registration is always present.
     private readonly IDailyOptionsFlowProvider? _dailyOptionsFlowProvider;
+    // Wave B / PR 5 (daily_atm_iv surface) — read-only provider for
+    // past-day backtest reads of aggregated ATM-IV. Nullable for tests
+    // that omit DI; in production the scoped registration is always present.
+    private readonly IDailyAtmIvProvider? _dailyAtmIvProvider;
     // Phase 1 micro-PR #8 — observability surface. Nullable for tests
     // that bypass DI; in production the singleton is always registered.
     private readonly MetricsCollector? _metrics;
@@ -57,6 +62,7 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         IMacroDataProvider? macroProvider = null,
         IOptionChainProvider? optionChainProvider = null,
         IDailyOptionsFlowProvider? dailyOptionsFlowProvider = null,
+        IDailyAtmIvProvider? dailyAtmIvProvider = null,
         MetricsCollector? metrics = null)
     {
         _logger = logger;
@@ -65,6 +71,7 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         _macroProvider = macroProvider;
         _optionChainProvider = optionChainProvider;
         _dailyOptionsFlowProvider = dailyOptionsFlowProvider;
+        _dailyAtmIvProvider = dailyAtmIvProvider;
         _metrics = metrics;
     }
 
@@ -819,6 +826,79 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
                 FlowScore = tmpRow.FlowScore.HasValue ? (double)tmpRow.FlowScore.Value : 0d,
                 FlowScoreIsNull = !tmpRow.FlowScore.HasValue,
                 ContractCount = tmpRow.ContractCount,
+            });
+        }
+        return tmpResp;
+    }
+
+    /// <summary>
+    /// Wave B / PR 5 of the ATM-IV full historical coverage plan
+    /// (docs/research/atm-iv-full-historical-coverage-plan-2026-05-03.md).
+    /// Read aggregated ATM-IV rows over [from, to] for one underlying.
+    /// Past-only guard rejects today-or-later (today's IV is computed
+    /// in-engine from the live snapshot/chain). No upstream fetch on
+    /// miss — empty rows means the seeder / daily cron has not populated
+    /// this window yet.
+    /// </summary>
+    public override async Task<GetDailyAtmIvResponse> GetDailyAtmIv(
+        GetDailyAtmIvRequest request, ServerCallContext context)
+    {
+        if (_dailyAtmIvProvider is null)
+        {
+            // DI not wired — typical only in tests that omit the provider.
+            throw new RpcException(new Status(StatusCode.Unimplemented,
+                "Daily-atm-iv provider is not registered."));
+        }
+        if (string.IsNullOrWhiteSpace(request.UnderlyingTicker))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "underlying_ticker is required."));
+        }
+        if (request.FromDate is null || request.ToDate is null)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "from_date and to_date are required."));
+        }
+
+        var tmpFromUtc = request.FromDate.ToDateTime();
+        var tmpToUtc = request.ToDate.ToDateTime();
+
+        if (tmpFromUtc > tmpToUtc)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "from_date must be <= to_date."));
+        }
+
+        // Past-only guard — same contract as the other 5 read RPCs.
+        PastOnlyRangeValidator.EnsurePastOnly(tmpFromUtc, tmpToUtc);
+
+        var tmpFromDate = DateOnly.FromDateTime(tmpFromUtc);
+        var tmpToDate = DateOnly.FromDateTime(tmpToUtc);
+
+        _logger.LogInformation(
+            "GetDailyAtmIv underlying={Underlying} from={From} to={To}",
+            request.UnderlyingTicker, tmpFromDate, tmpToDate);
+
+        var tmpRows = await _dailyAtmIvProvider.GetRangeAsync(
+            request.UnderlyingTicker, tmpFromDate, tmpToDate, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        var tmpResp = new GetDailyAtmIvResponse
+        {
+            // Cache-only surface — no upstream on miss.
+            CacheHit = true,
+        };
+        foreach (var tmpRow in tmpRows)
+        {
+            tmpResp.Rows.Add(new V1DailyAtmIvRow
+            {
+                UnderlyingTicker = tmpRow.UnderlyingTicker,
+                TradeDate = Timestamp.FromDateTime(
+                    tmpRow.TradeDate.ToDateTime(TimeOnly.MinValue, DateTimeKind.Utc)),
+                AtmIv = tmpRow.AtmIv.HasValue ? (double)tmpRow.AtmIv.Value : 0d,
+                AtmIvIsNull = !tmpRow.AtmIv.HasValue,
+                ContractCount = tmpRow.ContractCount ?? 0,
+                ContractCountIsNull = !tmpRow.ContractCount.HasValue,
             });
         }
         return tmpResp;

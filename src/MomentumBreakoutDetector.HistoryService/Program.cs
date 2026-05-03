@@ -116,6 +116,13 @@ builder.Services.AddScoped<IMacroDataProvider>(sp =>
 // — same scoping as the other read-mostly providers.
 builder.Services.AddScoped<IDailyOptionsFlowProvider, DailyOptionsFlowProvider>();
 
+// --- Daily ATM-IV (Wave B / PR 5 of the ATM-IV plan) --------------------
+// Read provider for the daily_atm_iv aggregate table. Wire the write
+// surface (UpsertAsync, RecordMissAsync) here too so Wave C / PR 6's
+// daily 08:00 ET cron + the seeder backfill mode (--surface
+// daily_atm_iv) land cleanly without re-touching this registration.
+builder.Services.AddScoped<IDailyAtmIvProvider, DailyAtmIvProvider>();
+
 // PR 3 — per-day computer used by both the cron and (transitively) the
 // seeder via the same algorithm. Scoped because IOptionsService from the
 // SDK is registered transient — taking it scoped keeps the resolution
