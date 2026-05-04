@@ -215,7 +215,171 @@ public class LiveOptionsSnapshotCaptureServiceTests
             Arg.Any<CancellationToken>());
     }
 
+    // ── Cursor pagination ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task FetchFullChainAsync_AccumulatesAcrossThreePages()
+    {
+        // Stub returns 3 pages: page1 (250 rows, next_url set),
+        // page2 (250 rows, next_url set), page3 (50 rows, next_url null).
+        // Total = 550 rows. Verifies the cursor loop walks all 3 pages.
+        var tmpPolygon = Substitute.For<IOptionsService>();
+        var tmpPage1 = MakePage(0, 250, nextCursor: "abc-page2");
+        var tmpPage2 = MakePage(250, 250, nextCursor: "def-page3");
+        var tmpPage3 = MakePage(500, 50, nextCursor: null);
+
+        tmpPolygon.GetChainSnapshotAsync(
+            Arg.Is<GetChainSnapshotRequest>(r => string.IsNullOrEmpty(r.Cursor)),
+            Arg.Any<CancellationToken>())
+            .Returns(tmpPage1);
+        tmpPolygon.GetChainSnapshotAsync(
+            Arg.Is<GetChainSnapshotRequest>(r => r.Cursor == "abc-page2"),
+            Arg.Any<CancellationToken>())
+            .Returns(tmpPage2);
+        tmpPolygon.GetChainSnapshotAsync(
+            Arg.Is<GetChainSnapshotRequest>(r => r.Cursor == "def-page3"),
+            Arg.Any<CancellationToken>())
+            .Returns(tmpPage3);
+
+        var tmpService = new LiveOptionsSnapshotCaptureService(
+            tmpPolygon,
+            new FakeTimeProvider(),
+            NullLogger<LiveOptionsSnapshotCaptureService>.Instance,
+            Options.Create(new LiveOptionsSnapshotCaptureOptions { LiveSnapshotCaptureEnabled = true }),
+            Options.Create(new HistoryServiceOptions()));
+
+        var tmpResult = await tmpService.FetchFullChainAsync(
+            "TSLA",
+            new DateOnly(2024, 1, 8),
+            new DateOnly(2024, 3, 8),
+            new DateTimeOffset(2024, 1, 8, 14, 30, 0, TimeSpan.Zero),
+            CancellationToken.None);
+
+        tmpResult.Count.ShouldBe(550, "all three pages should be accumulated");
+
+        // All 3 pages were fetched.
+        await tmpPolygon.Received(3).GetChainSnapshotAsync(
+            Arg.Any<GetChainSnapshotRequest>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task FetchFullChainAsync_AtmFilterRunsAgainstUnion()
+    {
+        // Three pages of strikes; ATM band keeps the middle page only.
+        // Confirms the filter is applied AFTER pagination accumulation,
+        // not per-page (which would discard the underlying-price-bearing
+        // page if it landed late).
+        var tmpPolygon = Substitute.For<IOptionsService>();
+
+        // Page 1: strikes 100,101,102 — well below the 200 ATM
+        // (no underlying price in this page).
+        var tmpPage1 = new PolygonResponse<List<OptionSnapshot>>
+        {
+            Status = "OK",
+            Results = new List<OptionSnapshot>
+            {
+                MakeSnap("p1-a", 100m),
+                MakeSnap("p1-b", 101m),
+                MakeSnap("p1-c", 102m),
+            },
+            NextUrl = "https://api.polygon.io/v3/snapshot/options/TSLA?cursor=p2-cursor",
+        };
+        // Page 2: strikes 195, 200, 205 — inside the band, AND carries
+        // the underlying-price anchor.
+        var tmpPage2 = new PolygonResponse<List<OptionSnapshot>>
+        {
+            Status = "OK",
+            Results = new List<OptionSnapshot>
+            {
+                MakeSnapWithUnderlying("p2-a", 195m, 200m),
+                MakeSnapWithUnderlying("p2-b", 200m, 200m),
+                MakeSnapWithUnderlying("p2-c", 205m, 200m),
+            },
+            NextUrl = "https://api.polygon.io/v3/snapshot/options/TSLA?cursor=p3-cursor",
+        };
+        // Page 3: strikes 300, 301 — well above ATM band.
+        var tmpPage3 = new PolygonResponse<List<OptionSnapshot>>
+        {
+            Status = "OK",
+            Results = new List<OptionSnapshot>
+            {
+                MakeSnap("p3-a", 300m),
+                MakeSnap("p3-b", 301m),
+            },
+            NextUrl = null,
+        };
+
+        tmpPolygon.GetChainSnapshotAsync(
+            Arg.Is<GetChainSnapshotRequest>(r => string.IsNullOrEmpty(r.Cursor)),
+            Arg.Any<CancellationToken>())
+            .Returns(tmpPage1);
+        tmpPolygon.GetChainSnapshotAsync(
+            Arg.Is<GetChainSnapshotRequest>(r => r.Cursor == "p2-cursor"),
+            Arg.Any<CancellationToken>())
+            .Returns(tmpPage2);
+        tmpPolygon.GetChainSnapshotAsync(
+            Arg.Is<GetChainSnapshotRequest>(r => r.Cursor == "p3-cursor"),
+            Arg.Any<CancellationToken>())
+            .Returns(tmpPage3);
+
+        var tmpService = new LiveOptionsSnapshotCaptureService(
+            tmpPolygon,
+            new FakeTimeProvider(),
+            NullLogger<LiveOptionsSnapshotCaptureService>.Instance,
+            Options.Create(new LiveOptionsSnapshotCaptureOptions { LiveSnapshotCaptureEnabled = true }),
+            Options.Create(new HistoryServiceOptions()));
+
+        var tmpUnion = await tmpService.FetchFullChainAsync(
+            "TSLA",
+            new DateOnly(2024, 1, 8),
+            new DateOnly(2024, 3, 8),
+            new DateTimeOffset(2024, 1, 8, 14, 30, 0, TimeSpan.Zero),
+            CancellationToken.None);
+
+        tmpUnion.Count.ShouldBe(8, "union of all pages");
+
+        // Filter the union with a band centered on 200 (±5%):
+        // [190, 210]. Only page 2's three rows survive.
+        var tmpFiltered = LiveOptionsSnapshotCaptureService
+            .FilterAtmBand(tmpUnion, inKLow: 190m, inKHigh: 210m)
+            .ToList();
+        tmpFiltered.Count.ShouldBe(3);
+        tmpFiltered.ShouldContain(r => r.Details!.Ticker == "p2-a");
+        tmpFiltered.ShouldContain(r => r.Details!.Ticker == "p2-b");
+        tmpFiltered.ShouldContain(r => r.Details!.Ticker == "p2-c");
+    }
+
+    [Theory]
+    [InlineData("https://api.polygon.io/v3/snapshot/options/TSLA?cursor=abc123", "abc123")]
+    [InlineData("https://api.polygon.io/v3/snapshot/options/TSLA?limit=250&cursor=xyz&sort=ticker", "xyz")]
+    [InlineData("https://api.polygon.io/v3/snapshot/options/TSLA?limit=250", null)]
+    [InlineData("", null)]
+    [InlineData(null, null)]
+    public void ExtractCursor_ParsesNextUrl(string? inUrl, string? inExpected)
+    {
+        LiveOptionsSnapshotCaptureService.ExtractCursor(inUrl).ShouldBe(inExpected);
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────
+
+    private static PolygonResponse<List<OptionSnapshot>> MakePage(
+        int inStart, int inCount, string? nextCursor)
+    {
+        var tmpResults = new List<OptionSnapshot>(inCount);
+        for (var i = 0; i < inCount; i++)
+        {
+            tmpResults.Add(MakeSnap($"O:TSLA240119C{(inStart + i):00000000}", 100m + (inStart + i)));
+        }
+        return new PolygonResponse<List<OptionSnapshot>>
+        {
+            Status = "OK",
+            Results = tmpResults,
+            NextUrl = string.IsNullOrEmpty(nextCursor)
+                ? null
+                : $"https://api.polygon.io/v3/snapshot/options/TSLA?cursor={nextCursor}",
+        };
+    }
+
 
     private LiveOptionsSnapshotCaptureService BuildService()
     {

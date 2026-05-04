@@ -144,13 +144,14 @@ public sealed class LiveOptionsSnapshotCaptureService : BackgroundService
         return ToUtc(tmpProbe, new TimeSpan(9, 30, 0));
     }
 
-    private DateTimeOffset ToUtc(DateOnly inDate, TimeSpan inEtTime)
-    {
-        var tmpEt = new DateTime(inDate.Year, inDate.Month, inDate.Day, 0, 0, 0,
-            DateTimeKind.Unspecified) + inEtTime;
-        return new DateTimeOffset(TimeZoneInfo.ConvertTimeToUtc(tmpEt, m_EasternTz),
+    private static DateTimeOffset ToUtc(DateOnly inDate, TimeSpan inEtTime)
+        // Delegate to the shared TradingCalendar helper so the schedule
+        // path and the bars-warmup path use one DST policy. The local
+        // m_EasternTz is preserved only for legacy tests that pin the
+        // resolved-TZ behavior directly.
+        => new DateTimeOffset(
+            TradingCalendar.ConvertEasternToUtc(inDate, inEtTime),
             TimeSpan.Zero);
-    }
 
     protected override async Task ExecuteAsync(CancellationToken inStopping)
     {
@@ -235,21 +236,21 @@ public sealed class LiveOptionsSnapshotCaptureService : BackgroundService
         var tmpToday = DateOnly.FromDateTime(inSnapshotTs.UtcDateTime);
         var tmpMaxExp = tmpToday.AddDays(m_Opts.SnapshotDteMaxDays);
 
-        var tmpReq = new GetChainSnapshotRequest
-        {
-            UnderlyingAsset = inSymbol,
-            ExpirationDateGte = tmpToday.ToString("yyyy-MM-dd"),
-            ExpirationDateLte = tmpMaxExp.ToString("yyyy-MM-dd"),
-            // Polygon caps at 250 per page; we don't paginate here
-            // because ATM±5% × 0-60 DTE on TSLA is well under one page
-            // worth (~120 contracts). If the band gets wider later, add
-            // cursor pagination.
-            Limit = 250,
-        };
+        // Cursor-paginate the chain snapshot. Polygon caps each page at
+        // 250 contracts; the full 0-60 DTE chain on a high-priced
+        // underlying (e.g. TSLA at ~$390 in 2026, post-doubling vs the
+        // initial 2024 design baseline of ~$175) exceeds one page —
+        // empirically observed ~chain=250 truncations at 5% capture
+        // rate (≈48 ATM-band rows per fire vs ~900 expected). The
+        // pagination loop mirrors MBD's production
+        // <c>OptionsAnalysisService.FetchChainAsync</c>: extract the
+        // <c>cursor=</c> query-param from <c>next_url</c> and feed it
+        // back via <see cref="GetChainSnapshotRequest.Cursor"/> until
+        // empty, with a safety cap to bound runaway pagination.
+        var tmpRows = await FetchFullChainAsync(
+            inSymbol, tmpToday, tmpMaxExp, inSnapshotTs, inCt).ConfigureAwait(false);
 
-        var tmpResp = await m_PolygonOptions.GetChainSnapshotAsync(tmpReq, inCt).ConfigureAwait(false);
-        var tmpRows = tmpResp?.Results;
-        if (tmpRows is null || tmpRows.Count == 0)
+        if (tmpRows.Count == 0)
         {
             m_Logger.LogWarning(
                 "LiveOptionsSnapshotCaptureService: empty chain for {Symbol} at {Ts:O}",
@@ -295,6 +296,82 @@ public sealed class LiveOptionsSnapshotCaptureService : BackgroundService
             inSymbol, inSnapshotTs, tmpUnderlyingPrice, tmpKLow, tmpKHigh,
             tmpRows.Count, tmpFiltered.Count, tmpPersisted);
     }
+
+    /// <summary>
+    /// Cursor-paginate the chain-snapshot endpoint and return the full
+    /// accumulated chain across all pages. Internal so unit tests can
+    /// drive the loop against a fake Polygon service.
+    /// </summary>
+    /// <remarks>
+    /// Page size is capped at 250 by Polygon. The loop terminates when
+    /// <see cref="PolygonResponse{T}.NextUrl"/> is null/empty, when the
+    /// safety cap is hit, or when the cancellation token fires. The
+    /// safety cap (250 × 50 = 12 500 contracts) is well above any
+    /// realistic 0-60 DTE chain on a single underlying — for context
+    /// pre-cutover MBD pulled the FULL chain at ~5 660 contracts/snapshot
+    /// for TSLA, and we filter to ATM±5% × 0-60 DTE which is much
+    /// narrower. Hitting the cap means a misconfigured filter, not a
+    /// legitimately huge chain.
+    /// </remarks>
+    internal async Task<IReadOnlyList<OptionSnapshot>> FetchFullChainAsync(
+        string inSymbol, DateOnly inExpFromDate, DateOnly inExpToDate,
+        DateTimeOffset inSnapshotTs, CancellationToken inCt)
+    {
+        var tmpAll = new List<OptionSnapshot>();
+        string? tmpCursor = null;
+        var tmpPage = 0;
+
+        do
+        {
+            tmpPage++;
+            var tmpReq = new GetChainSnapshotRequest
+            {
+                UnderlyingAsset = inSymbol,
+                ExpirationDateGte = inExpFromDate.ToString("yyyy-MM-dd"),
+                ExpirationDateLte = inExpToDate.ToString("yyyy-MM-dd"),
+                Limit = 250,
+                Cursor = tmpCursor,
+            };
+
+            var tmpResp = await m_PolygonOptions.GetChainSnapshotAsync(tmpReq, inCt)
+                .ConfigureAwait(false);
+            var tmpBatch = tmpResp?.Results;
+            if (tmpBatch is { Count: > 0 })
+            {
+                tmpAll.AddRange(tmpBatch);
+            }
+
+            tmpCursor = ExtractCursor(tmpResp?.NextUrl);
+            if (tmpPage >= ChainPaginationSafetyCap && !string.IsNullOrEmpty(tmpCursor))
+            {
+                m_Logger.LogWarning(
+                    "LiveOptionsSnapshotCaptureService: hit chain-pagination safety cap of {Cap} pages for {Symbol} at {Ts:O} — truncating at {Count} contracts",
+                    ChainPaginationSafetyCap, inSymbol, inSnapshotTs, tmpAll.Count);
+                break;
+            }
+        }
+        while (!string.IsNullOrEmpty(tmpCursor) && !inCt.IsCancellationRequested);
+
+        return tmpAll;
+    }
+
+    /// <summary>Extract the <c>cursor=</c> query-param value from a
+    /// Polygon <c>next_url</c>. Mirrors MBD's
+    /// <c>OptionsAnalysisService.ExtractCursor</c>.</summary>
+    internal static string? ExtractCursor(string? inNextUrl)
+    {
+        if (string.IsNullOrEmpty(inNextUrl)) return null;
+        var tmpQ = inNextUrl.IndexOf("cursor=", StringComparison.Ordinal);
+        if (tmpQ < 0) return null;
+        var tmpStart = tmpQ + "cursor=".Length;
+        var tmpEnd = inNextUrl.IndexOf('&', tmpStart);
+        return tmpEnd < 0 ? inNextUrl[tmpStart..] : inNextUrl[tmpStart..tmpEnd];
+    }
+
+    /// <summary>Hard ceiling on chain-snapshot pagination loops. 50 pages
+    /// × 250-row pages = 12 500 contracts — far above any realistic
+    /// ATM±5% × 0-60 DTE chain.</summary>
+    internal const int ChainPaginationSafetyCap = 50;
 
     /// <summary>
     /// Filter a chain to the ATM band (strike in [<paramref name="inKLow"/>,

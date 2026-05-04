@@ -155,6 +155,29 @@ public static class TradingCalendar
             TimeSpan.FromHours(-5), "EST-Fallback", "EST-Fallback");
     }
 
+    /// <summary>
+    /// Convert a wall-clock Eastern (ET) date+time-of-day to UTC using
+    /// the resolved Eastern timezone. DST-aware: in winter (EST) "midnight ET"
+    /// is 05:00 UTC; in summer (EDT) it is 04:00 UTC. Used by the bars
+    /// gap-detector to compute expected daily-bar timestamps that match
+    /// the cached row shape (which stores midnight-ET-as-UTC).
+    /// </summary>
+    /// <remarks>
+    /// Returns a <see cref="DateTime"/> with <see cref="DateTimeKind.Utc"/>.
+    /// Mirrors the <c>ToUtc</c> helper formerly inlined in
+    /// <c>LiveOptionsSnapshotCaptureService</c>; consolidated here so
+    /// callers across the service share one DST policy.
+    /// </remarks>
+    public static DateTime ConvertEasternToUtc(DateOnly inEtDate, TimeSpan inEtTimeOfDay)
+    {
+        var tmpEt = new DateTime(
+            inEtDate.Year, inEtDate.Month, inEtDate.Day, 0, 0, 0,
+            DateTimeKind.Unspecified) + inEtTimeOfDay;
+        return DateTime.SpecifyKind(
+            TimeZoneInfo.ConvertTimeToUtc(tmpEt, s_EasternTz),
+            DateTimeKind.Utc);
+    }
+
     /// <summary>True iff the given date is a weekday and not a full
     /// NYSE closure. Half-days return <c>true</c> — they are still
     /// trading days, just with shortened sessions.</summary>
