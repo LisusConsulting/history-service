@@ -504,17 +504,23 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
 
         if (inTimeframe == BarTimeframe.OneDay)
         {
-            // Daily bars are stored at 04:00 UTC for each trading day
-            // (MIDNIGHT_ET → UTC during EST is 05:00 UTC; during EDT is
-            // 04:00 UTC; cached shape uses 04:00 consistently per the
-            // current bars table). Yield one timestamp per trading day
-            // matching the stored convention.
+            // Daily bars are stored at MIDNIGHT_ET → UTC for each trading
+            // day. That is 05:00 UTC during EST (winter) and 04:00 UTC
+            // during EDT (summer). The previous implementation hardcoded
+            // 04:00 UTC year-round, which never matched winter rows
+            // stored at 05:00 UTC — the gap detector then declared every
+            // winter-EST trading day "missing" and the chunked range
+            // fetch wrote miss-markers for whole days that already had
+            // valid 05:00 UTC bars cached. Fridays at the end of a
+            // chunk were the most-visible victims (DB scan showed
+            // Mon=155 / Fri=110 for TSLA 2022-08-25..2026-05-01 — Fri
+            // dramatically under-represented). Use the calendar's
+            // DST-aware ET→UTC helper so the computed expected timestamps
+            // match the stored shape across both DST regimes. Tests pin
+            // both spring-forward and fall-back boundaries.
             foreach (var tmpDay in TradingCalendar.EnumerateTradingDays(tmpFromDate, tmpToDate))
             {
-                // Use 04:00 UTC as the daily bar boundary — that's what
-                // the cached rows use today. If this convention changes
-                // in the future the test suite will catch it.
-                var tmpTs = new DateTime(tmpDay.Year, tmpDay.Month, tmpDay.Day, 4, 0, 0, DateTimeKind.Utc);
+                var tmpTs = TradingCalendar.ConvertEasternToUtc(tmpDay, TimeSpan.Zero);
                 if (tmpTs >= inFromUtc && tmpTs <= inToUtc) tmpResult.Add(tmpTs);
             }
             return tmpResult;

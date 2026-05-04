@@ -271,6 +271,66 @@ public sealed class BarsIntraRangeGapDetectionTests : IAsyncLifetime
         tmpExpected.ShouldBeEmpty();
     }
 
+    // ── 8b. ComputeExpectedTimestamps — daily bars are DST-aware ────────
+
+    [Theory]
+    // Spring-forward 2024: Mar 10 = last EST day → 05:00 UTC; Mar 11 =
+    // first EDT day → 04:00 UTC. Mar 10 is a Sunday (non-trading), but
+    // the helper's date math is independent of trading-day filter — so
+    // we use Mar 8 (Friday EST) and Mar 11 (Monday EDT) for the boundary.
+    // Note Mar 10 itself is a non-trading day so the expected list won't
+    // include it; we cover it instead with the standalone
+    // ComputeExpectedTimestamps_DailyBars_DstAware test below.
+    [InlineData(2024, 3, 8, 5)]   // Fri EST
+    [InlineData(2024, 3, 11, 4)]  // Mon EDT
+    [InlineData(2024, 11, 1, 4)]  // Fri EDT (last EDT trading day before fall-back)
+    [InlineData(2024, 11, 4, 5)]  // Mon EST (first EST trading day after fall-back)
+    public void ComputeExpectedTimestamps_DailyBars_DstAware(int year, int month, int day, int expectedUtcHour)
+    {
+        // Window spanning the whole UTC day so the returned ts must
+        // fall inside [from, to].
+        var tmpFrom = new DateTime(year, month, day, 0, 0, 0, DateTimeKind.Utc);
+        var tmpTo = new DateTime(year, month, day, 23, 59, 0, DateTimeKind.Utc);
+
+        var tmpResult = HistoricalBarsProvider.ComputeExpectedTimestamps(
+            tmpFrom, tmpTo, BarTimeframe.OneDay);
+
+        tmpResult.Count.ShouldBe(1, $"{year}-{month:00}-{day:00} should yield exactly one daily bar timestamp");
+        tmpResult[0].Hour.ShouldBe(expectedUtcHour,
+            $"midnight ET on {year}-{month:00}-{day:00} should map to {expectedUtcHour:00}:00 UTC");
+        tmpResult[0].Year.ShouldBe(year);
+        tmpResult[0].Month.ShouldBe(month);
+        tmpResult[0].Day.ShouldBe(day);
+        tmpResult[0].Kind.ShouldBe(DateTimeKind.Utc);
+    }
+
+    [Fact]
+    public void ComputeExpectedTimestamps_DailyBars_FridayAcrossDstBoundary_BothPresent()
+    {
+        // Regression for the empirically-confirmed Friday under-representation
+        // bug. Pre-patch ComputeExpectedTimestamps yielded 04:00 UTC for
+        // every Friday year-round; the cached EST Friday rows sit at
+        // 05:00 UTC and were incorrectly flagged "missing", letting
+        // miss-markers shadow them on subsequent runs.
+        // Post-patch the function must yield the matching DST-aware hour
+        // for both an EST Friday AND an EDT Friday inside the same query.
+        var tmpFrom = new DateTime(2024, 1, 5, 0, 0, 0, DateTimeKind.Utc);   // Fri EST
+        var tmpTo   = new DateTime(2024, 7, 12, 23, 59, 0, DateTimeKind.Utc); // Fri EDT
+
+        var tmpResult = HistoricalBarsProvider.ComputeExpectedTimestamps(
+            tmpFrom, tmpTo, BarTimeframe.OneDay);
+
+        var tmpEstFriday = tmpResult.FirstOrDefault(t =>
+            t.Year == 2024 && t.Month == 1 && t.Day == 5);
+        tmpEstFriday.ShouldNotBe(default(DateTime));
+        tmpEstFriday.Hour.ShouldBe(5, "Jan 5 2024 (EST) Friday must be at 05:00 UTC");
+
+        var tmpEdtFriday = tmpResult.FirstOrDefault(t =>
+            t.Year == 2024 && t.Month == 7 && t.Day == 12);
+        tmpEdtFriday.ShouldNotBe(default(DateTime));
+        tmpEdtFriday.Hour.ShouldBe(4, "Jul 12 2024 (EDT) Friday must be at 04:00 UTC");
+    }
+
     [Fact]
     public void CoalesceContiguous_GroupsAdjacentMinutes()
     {
