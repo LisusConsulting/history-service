@@ -397,8 +397,17 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
         // short pg_advisory_xact_lock taken inside the persist path
         // (see UpsertBarsLockedAsync below) — Polygon HTTP RTT is NOT
         // held under the lock.
+        //
+        // Empty-chunk miss-markers are persisted INSIDE the loop, per
+        // chunk. The earlier "queue empties + write at end" pattern was
+        // a self-perpetuating bug: if the gRPC deadline expired mid-loop
+        // (likely with N sparse pre/AH zero-volume minutes producing N
+        // single-minute single-chunk Alpaca round-trips), the post-loop
+        // marker write never ran — so the SAME N hopeless fetches
+        // repeated on every subsequent call. Per-chunk persistence makes
+        // partial progress durable: even if the loop is canceled, every
+        // marker for chunks that completed lands.
         var tmpUpstreamCalls = 0;
-        var tmpEmptyChunks = new List<(DateTime From, DateTime To)>();
         for (var tmpIdx = 0; tmpIdx < tmpChunks.Count; tmpIdx++)
         {
             var (tmpChunkFrom, tmpChunkTo) = tmpChunks[tmpIdx];
@@ -449,7 +458,15 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
 
             if (tmpChunkEmpty)
             {
-                tmpEmptyChunks.Add((tmpChunkFrom, tmpChunkTo));
+                // Persist the marker for THIS chunk's missing timestamps
+                // before moving on. If a later chunk's fetch hangs and the
+                // gRPC deadline blows, this marker has already landed —
+                // the next call sees it and skips the fetch.
+                await PersistEmptyChunkMarkersAsync(
+                    tmpConn, inSymbol, tmpTimeframeStr,
+                    new[] { (tmpChunkFrom, tmpChunkTo) },
+                    tmpMissing, tmpStep, inCt);
+
                 if (inProgress is not null)
                 {
                     await inProgress(new BarsWarmupProgress(
@@ -468,19 +485,6 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
             // tmpRanHere is unused at present — captured for symmetry with
             // future "did this caller actually invoke the upstream" metrics.
             _ = tmpRanHere;
-        }
-
-        // 7. After fetching: any chunk whose response was empty AND whose
-        // missing-timestamps subset of `expected` is still missing → the
-        // chunk maps 1:1 to a range marker. We compute the marker ranges
-        // by re-coalescing the missing timestamps that fell inside any
-        // empty chunk and intersecting with that chunk. RangeMarkerWriter
-        // then merges with adjacent existing markers.
-        if (tmpEmptyChunks.Count > 0)
-        {
-            await PersistEmptyChunkMarkersAsync(
-                tmpConn, inSymbol, tmpTimeframeStr,
-                tmpEmptyChunks, tmpMissing, tmpStep, inCt);
         }
 
         return tmpUpstreamCalls;

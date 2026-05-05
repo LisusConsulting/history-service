@@ -225,6 +225,53 @@ public sealed class BarsIntraRangeGapDetectionTests : IAsyncLifetime
     // ── 7. Multiple disjoint gaps in one day → multiple markers ─────────
 
     [Fact]
+    public async Task ManySparseGaps_LoopCanceledMidway_PersistsCompletedMarkers()
+    {
+        // Regression test for the 2026-05-05 chart-500 bug:
+        // sparse pre/AH zero-volume minutes produce N single-minute single-
+        // chunk Alpaca round-trips. The OLD code queued empty-chunk results
+        // and persisted markers ONLY at end-of-loop — so a 5-sec gRPC
+        // deadline killed the operation BEFORE any marker landed, and the
+        // SAME N hopeless fetches repeated on every subsequent call.
+        //
+        // The fix persists each empty chunk's marker INLINE inside the
+        // loop. Even when the loop is canceled mid-way, the markers for
+        // chunks that completed land durably — so the next call sees them
+        // and skips those fetches.
+        //
+        // Setup: 5 sparse 1-min gaps (separated by >1 min so coalesce is
+        // foiled and we get 5 single-minute chunks), each fetch delayed
+        // 200ms. Cancellation token expires after 350ms — only ~1-2
+        // chunks complete before cancellation. Test asserts at least one
+        // marker landed despite cancellation.
+        await SeedBarsAsync(s_From, s_To,
+            (s_From.AddMinutes(2),  s_From.AddMinutes(2)),
+            (s_From.AddMinutes(5),  s_From.AddMinutes(5)),
+            (s_From.AddMinutes(9),  s_From.AddMinutes(9)),
+            (s_From.AddMinutes(14), s_From.AddMinutes(14)),
+            (s_From.AddMinutes(20), s_From.AddMinutes(20)));
+
+        var tmpStub = new SlowEmptyFetcher(perChunkDelay: TimeSpan.FromMilliseconds(200));
+        var tmpProvider = new HistoricalBarsProvider(
+            m_ConnStr, tmpStub, NullLogger<HistoricalBarsProvider>.Instance);
+
+        using var tmpCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(350));
+        try
+        {
+            await tmpProvider.EnsureRangeCachedAsync(
+                "TSLA", s_From, s_To, BarTimeframe.OneMinute, inCt: tmpCts.Token);
+        }
+        catch (OperationCanceledException) { /* expected */ }
+
+        var tmpMarkerCount = await CountMarkersAsync("1min");
+        tmpMarkerCount.ShouldBeGreaterThan(0L,
+            "per-chunk marker persistence guarantees partial progress lands " +
+            "even when the loop is canceled before all chunks complete");
+        tmpMarkerCount.ShouldBeLessThan(5L,
+            "the cancellation should have killed the loop before all 5 chunks finished");
+    }
+
+    [Fact]
     public async Task TwoDisjointGaps_BothEmpty_WriteTwoRangeMarkers()
     {
         // Cache covers everything except 14:05..14:09 (5 min) and 14:20..14:24 (5 min).
@@ -463,6 +510,30 @@ public sealed class BarsIntraRangeGapDetectionTests : IAsyncLifetime
                 tmpBars.Add(new Bar(inSymbol, tmpTs, 100, 101, 99, 100.5m, 1000, 100));
             }
             return Task.FromResult<IReadOnlyList<Bar>>(tmpBars);
+        }
+    }
+
+    /// <summary>
+    /// Stub fetcher that simulates a slow upstream by delaying each call.
+    /// Always returns empty so each chunk should produce a miss-marker.
+    /// Used by <c>ManySparseGaps_LoopCanceledMidway_PersistsCompletedMarkers</c>
+    /// to verify per-chunk marker persistence under mid-loop cancellation.
+    /// </summary>
+    private sealed class SlowEmptyFetcher : IPolygonBarFetcher
+    {
+        private readonly TimeSpan m_PerChunkDelay;
+
+        public SlowEmptyFetcher(TimeSpan perChunkDelay)
+        {
+            m_PerChunkDelay = perChunkDelay;
+        }
+
+        public async Task<IReadOnlyList<Bar>> FetchBarsAsync(
+            string inSymbol, DateTime inFromUtc, DateTime inToUtc,
+            BarTimeframe inTimeframe, CancellationToken inCt)
+        {
+            await Task.Delay(m_PerChunkDelay, inCt).ConfigureAwait(false);
+            return Array.Empty<Bar>();
         }
     }
 
