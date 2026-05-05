@@ -61,11 +61,14 @@ services:
       # on the paid SIP feed. Same fail-quiet contract as Polygon when
       # unset.
       #
-      # Env-var names: HWZ_PPR_KID / HWZ_PPR_SK in .env. Distinct from
-      # MBD's ALPACA_API_KEY / ALPACA_API_SECRET — this clone uses a
-      # separate Alpaca account (data API only, account-independent).
-      History__AlpacaApiKey: ${HWZ_PPR_KID:-}
-      History__AlpacaApiSecret: ${HWZ_PPR_SK:-}
+      # Env-var names: HISTORY_ALPACA_KEY / HISTORY_ALPACA_SECRET in .env.
+      # Renamed 2026-05-04 from HWZ_PPR_KID/HWZ_PPR_SK — those names
+      # collide with persistent shell env vars on the operator's machine,
+      # and Docker Compose's ${VAR} interpolation prefers shell over .env,
+      # silently overriding rotated keys with stale shell values. The new
+      # names do NOT collide with any known shell var.
+      History__AlpacaApiKey: ${HISTORY_ALPACA_KEY:-}
+      History__AlpacaApiSecret: ${HISTORY_ALPACA_SECRET:-}
       # "sip" (paid, full consolidated tape) or "iex" (free, IEX-only).
       # Default sip — Lisus has the paid Alpaca subscription.
       History__AlpacaDataFeed: ${ALPACA_DATA_FEED:-sip}
@@ -79,6 +82,10 @@ services:
       History__GitCommit: ${GIT_COMMIT:-unknown}
       History__GitBranch: ${GIT_BRANCH:-unknown}
       History__BuildTime: ${BUILD_TIME:-unknown}
+      # Live-capture cron master flag. Defaults true so the cron fires
+      # 5-min during RTH; set to false in .env to disable. .env entry
+      # is HISTORY__LIVESNAPSHOTCAPTURE__LIVESNAPSHOTCAPTUREENABLED.
+      History__LiveSnapshotCapture__LiveSnapshotCaptureEnabled: ${HISTORY__LIVESNAPSHOTCAPTURE__LIVESNAPSHOTCAPTUREENABLED:-true}
     ports:
       # 30005 host -> 8080 container = gRPC. Avoids dev (10005) / paper (20005).
       - "30005:8080"
