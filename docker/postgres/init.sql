@@ -41,3 +41,8 @@
 -- (PR 3) deploy.
 \i /docker-entrypoint-initdb.d/migrations/013-historical-options-snapshots.sql
 \i /docker-entrypoint-initdb.d/migrations/014-daily-atm-iv.sql
+-- 015 — Phase 4 of mbd-data-provider centralization (2026-05-09).
+-- Creates option_contract_snapshots hypertable that data-provider rolls
+-- over here at end-of-day. Polygon doesn't time-travel for these
+-- intraday snapshots, so this is the only persistent record.
+\i /docker-entrypoint-initdb.d/migrations/015-create-option-contract-snapshots.sql

@@ -23,10 +23,11 @@ logs/
 # Local scratch (seeder checkpoints, ad-hoc smoke runs, etc.)
 .tmp/
 
-# Seeder operator artifacts — checkpoints + per-symbol run logs.
-# Both are local state; not source-controllable.
+# Seeder operator artifacts — checkpoints + per-symbol run logs +
+# detached-process PID files. All local runtime state.
 tools/seed/checkpoint.*.json
 tools/seed/seed.*.log
+tools/seed/seed.*.pid
 
 # Environment / secrets
 .env
