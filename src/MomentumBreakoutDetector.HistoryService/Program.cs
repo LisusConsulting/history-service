@@ -160,6 +160,39 @@ builder.Services.AddSingleton<
     MomentumBreakoutDetector.HistoryService.Pricing.BlackScholes.IBlackScholesSolver,
     MomentumBreakoutDetector.HistoryService.Pricing.BlackScholes.BlackScholesSolver>();
 
+// --- Alpaca-backed market calendar (2026-05-12) -------------------------
+// Replaces the hardcoded NYSE holiday list in TradingCalendar. The static
+// facade in TradingCalendar gets its Source set at startup (right after
+// container build, before the first cron tick); on cache miss + upstream
+// down, falls back to the hardcoded list (still covers 2022-2026).
+//
+// Reuses the Alpaca data credentials that history-service already has
+// for AlpacaBarFetcher (History__AlpacaApiKey / History__AlpacaApiSecret).
+String tmpCalBase =
+    Environment.GetEnvironmentVariable("ALPACA_BROKER_BASE_URL")
+    ?? "https://paper-api.alpaca.markets/";
+String tmpCalKey =
+    builder.Configuration["History:AlpacaApiKey"]
+    ?? Environment.GetEnvironmentVariable("ALPACA_API_KEY")
+    ?? "";
+String tmpCalSec =
+    builder.Configuration["History:AlpacaApiSecret"]
+    ?? Environment.GetEnvironmentVariable("ALPACA_API_SECRET")
+    ?? "";
+builder.Services.AddHttpClient("alpaca-calendar", inClient =>
+{
+    inClient.BaseAddress = new Uri(tmpCalBase.TrimEnd('/') + "/");
+    inClient.Timeout = TimeSpan.FromSeconds(10);
+    if (!String.IsNullOrEmpty(tmpCalKey))
+        inClient.DefaultRequestHeaders.Add("APCA-API-KEY-ID", tmpCalKey);
+    if (!String.IsNullOrEmpty(tmpCalSec))
+        inClient.DefaultRequestHeaders.Add("APCA-API-SECRET-KEY", tmpCalSec);
+});
+builder.Services.AddSingleton<MomentumBreakoutDetector.HistoryService.Domain.AlpacaMarketCalendar>();
+builder.Services.AddSingleton<MomentumBreakoutDetector.HistoryService.Domain.IMarketCalendar>(sp =>
+    sp.GetRequiredService<MomentumBreakoutDetector.HistoryService.Domain.AlpacaMarketCalendar>());
+builder.Services.AddHostedService<MomentumBreakoutDetector.HistoryService.Domain.MarketCalendarWarmupService>();
+
 // PR 3 — daily refresh cron. Bind options from History:DailyFlowRefresh.
 builder.Services.Configure<DailyOptionsFlowRefreshOptions>(
     builder.Configuration.GetSection(DailyOptionsFlowRefreshOptions.SectionName));
@@ -237,6 +270,15 @@ builder.Services.AddScoped<IHistoricalBarsProvider, HistoricalBarsProvider>();
 
 // --- App ------------------------------------------------------------------
 var app = builder.Build();
+
+// 2026-05-12: wire the Alpaca-backed calendar into the TradingCalendar
+// static facade. All existing callers (DailyAtmIvRefreshService,
+// DailyOptionsFlowRefreshService, LiveOptionsSnapshotCaptureService,
+// HistoricalBarsProvider) keep their static-API usage unchanged; behind
+// the scenes lookups now route through Alpaca first, with the hardcoded
+// NYSE holiday list as a fallback when the upstream is unreachable.
+MomentumBreakoutDetector.HistoryService.Domain.TradingCalendar.Source =
+    app.Services.GetRequiredService<MomentumBreakoutDetector.HistoryService.Domain.IMarketCalendar>();
 
 app.MapGrpcService<HistoryServiceImpl>();
 

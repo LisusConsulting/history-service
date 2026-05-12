@@ -178,18 +178,51 @@ public static class TradingCalendar
             DateTimeKind.Utc);
     }
 
-    /// <summary>True iff the given date is a weekday and not a full
-    /// NYSE closure. Half-days return <c>true</c> — they are still
-    /// trading days, just with shortened sessions.</summary>
+    /// <summary>
+    /// 2026-05-12: optional Alpaca-backed source set at startup by DI.
+    /// When non-null, <see cref="IsTradingDay"/> + <see cref="IsHalfDay"/>
+    /// route through it first; if it returns null (cache miss + upstream
+    /// down) they fall back to the hardcoded list below. When the static
+    /// API is called without DI (e.g. unit tests that don't bootstrap
+    /// the host), the hardcoded list is the sole source — preserves
+    /// pre-existing test fixture behaviour.
+    /// </summary>
+    public static IMarketCalendar? Source { get; set; }
+
+    /// <summary>True iff the given date is a trading day. Routes through
+    /// <see cref="Source"/> when set (Alpaca-backed); falls back to the
+    /// hardcoded NYSE holiday list.</summary>
     public static bool IsTradingDay(DateOnly inDate)
     {
+        var tmpSrc = Source;
+        if (tmpSrc is not null)
+        {
+            var tmpAnswer = tmpSrc.TryIsTradingDay(inDate);
+            if (tmpAnswer.HasValue) return tmpAnswer.Value;
+        }
+        // Fallback: weekday + hardcoded holiday check. The hardcoded
+        // list covers 2022-2026 (NYSE-verified); for 2027+ dates with
+        // no calendar Source available, this degrades to "every weekday
+        // is a trading day" — same behaviour as the codebase had
+        // pre-2026-05-12.
         if (inDate.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) return false;
         if (s_Holidays.Contains(inDate)) return false;
         return true;
     }
 
-    /// <summary>True iff the given date is a half-day (early close at 13:00 ET).</summary>
-    public static bool IsHalfDay(DateOnly inDate) => s_HalfDays.Contains(inDate);
+    /// <summary>True iff the given date is a half-day (early close).
+    /// Routes through <see cref="Source"/> when set; falls back to the
+    /// hardcoded half-day list.</summary>
+    public static bool IsHalfDay(DateOnly inDate)
+    {
+        var tmpSrc = Source;
+        if (tmpSrc is not null)
+        {
+            var tmpAnswer = tmpSrc.TryIsHalfDay(inDate);
+            if (tmpAnswer.HasValue) return tmpAnswer.Value;
+        }
+        return s_HalfDays.Contains(inDate);
+    }
 
     /// <summary>
     /// Iterate every trading day in [<paramref name="inFrom"/>,
