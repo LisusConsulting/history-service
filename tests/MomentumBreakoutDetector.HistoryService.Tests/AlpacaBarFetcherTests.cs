@@ -180,10 +180,14 @@ public sealed class AlpacaBarFetcherTests
     }
 
     [Fact]
-    public async Task FetchBarsAsync_RateLimit_FailsQuietWithEmptyList()
+    public async Task FetchBarsAsync_RateLimit_PropagatesAsTransient()
     {
-        // Arrange — 429 fail-quiets too (caller writes a miss marker;
-        // subsequent runs hit the marker and skip re-fetch).
+        // 2026-05-11 fix: 429 no longer fail-quiets. Pre-fix the empty-list
+        // return triggered the caller to write a miss-marker, which poisoned
+        // the cache — subsequent runs hit the marker and skipped re-fetch,
+        // losing the rate-limited range until a manual backfill. Now 429
+        // throws, surfacing the transient throttle so the gap stays open
+        // for the next request to re-attempt.
         var tmpFromTs = new DateTime(2026, 4, 15, 13, 30, 0, DateTimeKind.Utc);
         var tmpToTs = tmpFromTs.AddMinutes(1);
 
@@ -197,12 +201,13 @@ public sealed class AlpacaBarFetcherTests
             tmpClient, MarketDataFeed.Sip,
             NullLogger<AlpacaBarFetcher>.Instance);
 
-        // Act
-        var tmpResult = await tmpFetcher.FetchBarsAsync(
-            "TSLA", tmpFromTs, tmpToTs, BarTimeframe.OneMinute, CancellationToken.None);
-
-        // Assert
-        tmpResult.ShouldBeEmpty();
+        // Act + Assert — the 429 must propagate, not fail-quiet with empty.
+        var tmpEx = await Should.ThrowAsync<HttpRequestException>(async () =>
+        {
+            await tmpFetcher.FetchBarsAsync(
+                "TSLA", tmpFromTs, tmpToTs, BarTimeframe.OneMinute, CancellationToken.None);
+        });
+        tmpEx.StatusCode.ShouldBe(HttpStatusCode.TooManyRequests);
     }
 
     [Fact]

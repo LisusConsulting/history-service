@@ -185,13 +185,22 @@ public sealed class PolygonBarFetcher : IPolygonBarFetcher
         }
         if (tmpResp.StatusCode == HttpStatusCode.TooManyRequests)
         {
-            // 429 — back off rather than fail-loud. Caller writes a
-            // miss-marker; subsequent runs hit the marker and skip
-            // re-fetch.
+            // 2026-05-11 fix: throw on persistent 429 instead of returning
+            // empty. Pre-fix the empty return triggered the caller's miss-
+            // marker write, poisoning the cache: subsequent runs hit the
+            // marker and never re-fetch — losing the rate-limited range
+            // permanently until a manual backfill. The PolygonRetryHandler
+            // already retries 429 with Retry-After respect (3 attempts);
+            // if we still see 429 here, it's a sustained throttle that
+            // shouldn't be conflated with an authoritative "no data"
+            // response. Throwing surfaces it as a transient failure and
+            // leaves the gap open for the next request to re-attempt.
             m_Logger.LogWarning(
-                "Bars 429 rate-limited for {Symbol} {Timeframe} {From}..{To} — treating as miss for this run",
+                "Bars 429 rate-limited for {Symbol} {Timeframe} {From}..{To} — propagating as transient (not poisoning cache)",
                 inSymbol, inTimeframe, tmpFromStr, tmpToStr);
-            return Array.Empty<Bar>();
+            if (tmpResp.Error is not null) throw tmpResp.Error;
+            throw new HttpRequestException(
+                $"Polygon /v2/aggs rate-limited (429) for {inSymbol} {inTimeframe} {tmpFromStr}..{tmpToStr} after retry-handler exhausted attempts");
         }
 
         if (!tmpResp.IsSuccessStatusCode)

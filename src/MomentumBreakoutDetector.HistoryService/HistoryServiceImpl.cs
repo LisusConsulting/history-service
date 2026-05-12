@@ -131,13 +131,24 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
     /// only declares minute / 5-minute / day) — the warmup orchestrator
     /// can extend the proto in a later PR if intermediate timeframes
     /// become callable.
+    ///
+    /// 2026-05-11 fix: reject <c>BAR_TIMEFRAME_UNSPECIFIED</c> (the
+    /// proto's zero-default value — what a client sees when the field
+    /// is not set) and any future enum extension not yet mapped here.
+    /// Pre-fix the default arm silently mapped both to OneMinute,
+    /// causing a client that forgot to set the timeframe field to
+    /// receive minute bars for what they intended as day bars (or any
+    /// other timeframe). gRPC clients are supposed to surface this as
+    /// InvalidArgument; failing closed is the contract-correct shape.
     /// </summary>
     private static DomainBarTimeframe MapTimeframe(BarTimeframe inWire) => inWire switch
     {
         BarTimeframe.Minute => DomainBarTimeframe.OneMinute,
         BarTimeframe.FiveMinute => DomainBarTimeframe.FiveMinutes,
         BarTimeframe.Day => DomainBarTimeframe.OneDay,
-        _ => DomainBarTimeframe.OneMinute,
+        _ => throw new RpcException(new Status(
+            StatusCode.InvalidArgument,
+            $"timeframe is required and must be one of {{Minute, FiveMinute, Day}}; got {inWire}")),
     };
 
     public override async Task<GetNbboResponse> GetNbbo(GetNbboRequest request, ServerCallContext context)

@@ -257,10 +257,16 @@ public sealed class PolygonChainFetcher : IPolygonChainFetcher
 
         if (inStatus == HttpStatusCode.TooManyRequests)
         {
+            // 2026-05-11 fix: throw instead of returning empty. PolygonRetryHandler
+            // already retries 429 with Retry-After respect; if we see 429 here
+            // it's persistent throttling, not a "no data" answer. The pre-fix
+            // path poisoned the cache with miss-markers and the rate-limited
+            // chain day was lost until manual backfill.
             m_Logger.LogWarning(
-                "Chains 429 rate-limited for {Symbol} as_of {AsOf} — treating as miss for this run",
+                "Chains 429 rate-limited for {Symbol} as_of {AsOf} — propagating as transient (not poisoning cache)",
                 inSymbol, inAsOfStr);
-            return Array.Empty<OptionsContract>();
+            throw new HttpRequestException(
+                $"Polygon chains rate-limited (429) for {inSymbol} as_of {inAsOfStr} after retry-handler exhausted attempts");
         }
 
         return null;
