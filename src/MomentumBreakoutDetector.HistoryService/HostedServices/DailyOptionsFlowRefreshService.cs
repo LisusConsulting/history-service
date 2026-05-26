@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -50,6 +51,7 @@ public sealed class DailyOptionsFlowRefreshService : BackgroundService
 {
     private readonly IDailyOptionsFlowComputer m_Computer;
     private readonly IDailyOptionsFlowProvider m_Provider;
+    private readonly IServiceScopeFactory m_ScopeFactory;
     private readonly TimeProvider m_TimeProvider;
     private readonly ILogger<DailyOptionsFlowRefreshService> m_Logger;
     private readonly DailyOptionsFlowRefreshOptions m_Opts;
@@ -58,12 +60,14 @@ public sealed class DailyOptionsFlowRefreshService : BackgroundService
     public DailyOptionsFlowRefreshService(
         IDailyOptionsFlowComputer inComputer,
         IDailyOptionsFlowProvider inProvider,
+        IServiceScopeFactory inScopeFactory,
         TimeProvider inTimeProvider,
         ILogger<DailyOptionsFlowRefreshService> inLogger,
         IOptions<DailyOptionsFlowRefreshOptions> inOpts)
     {
         m_Computer = inComputer;
         m_Provider = inProvider;
+        m_ScopeFactory = inScopeFactory;
         m_TimeProvider = inTimeProvider;
         m_Logger = inLogger;
         m_Opts = inOpts.Value;
@@ -162,6 +166,61 @@ public sealed class DailyOptionsFlowRefreshService : BackgroundService
         m_Logger.LogInformation(
             "DailyOptionsFlowRefreshService: rolling flow for {Date} (today-in-ET={Today})",
             tmpPreviousTradingDay, tmpToday);
+
+        // 2026-05-15 SELF-SUFFICIENT WARM-UP — closes the long-standing
+        // hidden dependency on MBD api activity. Pre-fix the flow cron
+        // read historical_options_contracts as the contract universe; if
+        // nobody had queried that chain date via the MBD picker recently,
+        // the table was empty and the cron silently recorded a miss. On
+        // a week where MBD ran only backtest sweeps (which query OLDER
+        // chain dates, not today's) the cron degraded silently and
+        // daily_options_flow stayed stuck at the last good day.
+        //
+        // Fix: open a scope, resolve IOptionChainProvider, and call
+        // EnsureChainCachedAsync(symbol, prevTradingDay) BEFORE the
+        // compute step. The chain provider's GapLockExecutor de-dups
+        // concurrent warm calls, and the underlying Polygon fetch is
+        // upsert-idempotent — re-running is a no-op when the chain is
+        // already cached. Warm-up failures fall through to compute (which
+        // will then record a legitimate miss-marker) so the cron never
+        // hangs.
+        //
+        // Per-symbol loop because each symbol has its own chain universe
+        // and per-call rate-limit budget; doing them serially keeps the
+        // existing concurrency semantics intact.
+        using (var tmpWarmScope = m_ScopeFactory.CreateScope())
+        {
+            // Use GetService (returns null) rather than GetRequiredService
+            // (throws) so test setups + bootstrap-during-startup scenarios
+            // gracefully degrade. When the chain provider isn't wired (test
+            // fixtures, future deploys that disable the surface), we just
+            // skip the warm step and let the compute path record a legit
+            // miss-marker — same behaviour as pre-fix.
+            var tmpChain = tmpWarmScope.ServiceProvider.GetService<IOptionChainProvider>();
+            if (tmpChain is null)
+            {
+                m_Logger.LogDebug(
+                    "DailyOptionsFlowRefreshService: IOptionChainProvider not registered — skipping warm-up");
+            }
+            else
+            {
+                foreach (var tmpSymbol in m_Opts.Symbols)
+                {
+                    inCt.ThrowIfCancellationRequested();
+                    try
+                    {
+                        await tmpChain.EnsureChainCachedAsync(
+                            tmpSymbol, tmpPreviousTradingDay, inCt).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        m_Logger.LogWarning(ex,
+                            "DailyOptionsFlowRefreshService: chain warm-up failed for {Symbol} {Date} — proceeding to compute (will likely record a miss-marker)",
+                            tmpSymbol, tmpPreviousTradingDay);
+                    }
+                }
+            }
+        }
 
         foreach (var tmpSymbol in m_Opts.Symbols)
         {

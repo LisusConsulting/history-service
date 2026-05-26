@@ -179,10 +179,20 @@ public sealed class AlpacaBarFetcher : IPolygonBarFetcher
             }
             if (tmpStatus == HttpStatusCode.TooManyRequests)
             {
-                m_Logger.LogWarning(
-                    "Alpaca bars 429 rate-limited for {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd} — treating as miss for this run",
+                // 2026-05-11 fix: throw on 429 rather than return empty.
+                // Pre-fix the empty return caused HistoricalBarsProvider to
+                // persist an empty-chunk miss-marker, poisoning the cache —
+                // the next request would skip the rate-limited range and
+                // serve "no data" for what was actually a temporary throttle.
+                // Alpaca's SDK doesn't expose a Retry-After hook the way
+                // Polygon's HttpClient handler does, so we just propagate
+                // the exception; the gap stays open and the next fetch tries
+                // again. Sustained 429 is a real ALPACA_API_KEY / plan issue
+                // and the operator should see the loud failure.
+                m_Logger.LogWarning(tmpEx,
+                    "Alpaca bars 429 rate-limited for {Symbol} {Timeframe} {From:yyyy-MM-dd}..{To:yyyy-MM-dd} — propagating as transient (not poisoning cache)",
                     inSymbol, inTimeframe, inFromUtc, inToUtc);
-                return Array.Empty<Bar>();
+                throw;
             }
             // 5xx / unknown — fail loud.
             m_Logger.LogError(tmpEx,

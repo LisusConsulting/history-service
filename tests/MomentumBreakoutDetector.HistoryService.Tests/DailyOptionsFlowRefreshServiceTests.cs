@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
@@ -40,9 +41,15 @@ public class DailyOptionsFlowRefreshServiceTests
         TimeProvider inTimeProvider,
         DailyOptionsFlowRefreshOptions? inOpts = null)
     {
+        // 2026-05-15: cron now warms IOptionChainProvider via a scoped
+        // resolution before computing. Tests don't exercise the warmup
+        // step; the cron catches resolution failures gracefully so an
+        // empty scope-factory (no IOptionChainProvider registered) just
+        // logs a warning and proceeds to the compute step under test.
         return new DailyOptionsFlowRefreshService(
             inComputer,
             inProvider,
+            new EmptyScopeFactory(),
             inTimeProvider,
             NullLogger<DailyOptionsFlowRefreshService>.Instance,
             Options.Create(inOpts ?? new DailyOptionsFlowRefreshOptions
@@ -51,6 +58,27 @@ public class DailyOptionsFlowRefreshServiceTests
                 FireHourEt = 8,
                 FireMinuteEt = 0,
             }));
+    }
+
+    /// <summary>
+    /// Minimal IServiceScopeFactory for the cron's chain-warmup step.
+    /// Returns a scope whose provider has no IOptionChainProvider
+    /// registered — GetRequiredService throws, the cron's try/catch
+    /// logs a warning, and the test path under examination (the
+    /// compute step) runs as before.
+    /// </summary>
+    private sealed class EmptyScopeFactory : IServiceScopeFactory
+    {
+        public IServiceScope CreateScope() => new EmptyScope();
+        private sealed class EmptyScope : IServiceScope
+        {
+            public IServiceProvider ServiceProvider { get; } = new EmptyProvider();
+            public void Dispose() { }
+            private sealed class EmptyProvider : IServiceProvider
+            {
+                public object? GetService(Type serviceType) => null;
+            }
+        }
     }
 
     [Fact]
