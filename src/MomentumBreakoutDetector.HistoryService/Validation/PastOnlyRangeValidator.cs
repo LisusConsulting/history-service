@@ -62,6 +62,28 @@ public static class PastOnlyRangeValidator
     private static DateTime ComputeTodayBoundaryUtc()
     {
         var tmpNowEt = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, s_EasternTz);
+
+        // 2026-05-26 — post-close same-day override. When env var
+        // HISTORY_POST_CLOSE_OPEN_AT_ET is set to "HH:mm" (ET) and the
+        // current ET wall-clock is >= that time, today becomes past-day
+        // (boundary advances to tomorrow's midnight ET). Use case:
+        // live-vs-backtest divergence audit run after the close while
+        // Polygon historical APIs already have full-day data.
+        var tmpOverride = Environment.GetEnvironmentVariable("HISTORY_POST_CLOSE_OPEN_AT_ET");
+        if (!string.IsNullOrWhiteSpace(tmpOverride) &&
+            TimeSpan.TryParse(tmpOverride, out var tmpOpenAt))
+        {
+            var tmpOpenAtToday = tmpNowEt.Date.Add(tmpOpenAt);
+            if (tmpNowEt >= tmpOpenAtToday)
+            {
+                // "Today is past" — boundary is tomorrow's midnight ET.
+                var tmpTomorrowEtMidnight = new DateTime(
+                    tmpNowEt.Year, tmpNowEt.Month, tmpNowEt.Day, 0, 0, 0, DateTimeKind.Unspecified)
+                    .AddDays(1);
+                return TimeZoneInfo.ConvertTimeToUtc(tmpTomorrowEtMidnight, s_EasternTz);
+            }
+        }
+
         var tmpTodayEtMidnight = new DateTime(
             tmpNowEt.Year, tmpNowEt.Month, tmpNowEt.Day, 0, 0, 0, DateTimeKind.Unspecified);
         return TimeZoneInfo.ConvertTimeToUtc(tmpTodayEtMidnight, s_EasternTz);

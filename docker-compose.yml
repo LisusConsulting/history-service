@@ -86,6 +86,14 @@ services:
       # 5-min during RTH; set to false in .env to disable. .env entry
       # is HISTORY__LIVESNAPSHOTCAPTURE__LIVESNAPSHOTCAPTUREENABLED.
       History__LiveSnapshotCapture__LiveSnapshotCaptureEnabled: ${HISTORY__LIVESNAPSHOTCAPTURE__LIVESNAPSHOTCAPTUREENABLED:-true}
+      # 2026-05-26: post-close same-day rebacktest enabler. When set to
+      # "HH:mm" (ET) and current ET wall-clock >= that time, the
+      # PastOnlyRangeValidator advances today's boundary to tomorrow's
+      # midnight ET — i.e., today becomes "past-day" and the backtest
+      # engine can fetch today's historical bars/NBBO/chains via gRPC.
+      # Unset (default) preserves the strict midnight-ET boundary.
+      # Suggested value: "16:30" (30 min after market close).
+      HISTORY_POST_CLOSE_OPEN_AT_ET: ${HISTORY_POST_CLOSE_OPEN_AT_ET:-}
     ports:
       # 30005 host -> 8080 container = gRPC. Avoids dev (10005) / paper (20005).
       - "30005:8080"
