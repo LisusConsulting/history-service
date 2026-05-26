@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
@@ -115,8 +116,15 @@ public class DailyOptionsFlowRefreshIntegrationTests : IAsyncLifetime
             _postgres.GetConnectionString(),
             NullLogger<DailyOptionsFlowProvider>.Instance);
 
+        // 2026-05-15: cron now warms IOptionChainProvider before compute;
+        // integration test doesn't exercise the warmup step (which depends
+        // on Polygon HTTP + the chain provider's persist path). Empty
+        // scope-factory returns a scope with no provider registered →
+        // GetRequiredService throws → cron logs warning + falls through
+        // to the compute step under test.
         var tmpSvc = new DailyOptionsFlowRefreshService(
             tmpComputer, tmpProvider,
+            new EmptyScopeFactoryForTest(),
             new FakeTimeProvider(tmpNowUtc),
             NullLogger<DailyOptionsFlowRefreshService>.Instance,
             Options.Create(new DailyOptionsFlowRefreshOptions
@@ -188,4 +196,25 @@ public class DailyOptionsFlowRefreshIntegrationTests : IAsyncLifetime
         "O:TSLA260119P00240000" => 150UL,
         _ => 0UL,
     };
+}
+
+/// <summary>
+/// 2026-05-15: minimal IServiceScopeFactory for the chain-warmup step
+/// the cron now runs before compute. Returns a scope whose provider
+/// resolves IOptionChainProvider to null — GetRequiredService throws,
+/// the cron's try/catch logs a warning, and the integration test's
+/// compute-step assertions still run.
+/// </summary>
+internal sealed class EmptyScopeFactoryForTest : IServiceScopeFactory
+{
+    public IServiceScope CreateScope() => new EmptyScope();
+    private sealed class EmptyScope : IServiceScope
+    {
+        public IServiceProvider ServiceProvider { get; } = new EmptyProvider();
+        public void Dispose() { }
+        private sealed class EmptyProvider : IServiceProvider
+        {
+            public object? GetService(Type serviceType) => null;
+        }
+    }
 }
