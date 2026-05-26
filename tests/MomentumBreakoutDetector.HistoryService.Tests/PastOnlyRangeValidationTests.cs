@@ -676,6 +676,136 @@ public sealed class PastOnlyRangeValidationTests
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // Post-close same-day override (HISTORY_POST_CLOSE_OPEN_AT_ET env var).
+    //
+    // When set to "HH:mm" (ET) and the current ET wall-clock is at or
+    // past that time, today's data becomes "past-day" — the boundary
+    // advances to tomorrow's midnight ET so backtests can fetch the
+    // current day's bars/NBBO/chains via gRPC.
+    // ─────────────────────────────────────────────────────────────────
+
+    private const string c_OverrideEnvVar = "HISTORY_POST_CLOSE_OPEN_AT_ET";
+
+    /// <summary>
+    /// Compute today's ET wall-clock time-of-day. Tests use this to
+    /// pick override values that are deterministically in the past or
+    /// future relative to wall-clock — no fragile sleep / clock-mock.
+    /// </summary>
+    private static TimeSpan NowEtTimeOfDay()
+    {
+        var tmpEt = ResolveEasternTz();
+        return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tmpEt).TimeOfDay;
+    }
+
+    [Fact]
+    public void Validator_PostCloseOverride_Unset_PreservesMidnightBoundary()
+    {
+        // Sanity check: with the env var unset, validation behaves as the
+        // pre-override baseline (rejects any timestamp at-or-after today's
+        // midnight ET).
+        var tmpPrev = Environment.GetEnvironmentVariable(c_OverrideEnvVar);
+        Environment.SetEnvironmentVariable(c_OverrideEnvVar, null);
+        try
+        {
+            var tmpBoundary = TodayBoundaryUtc();
+            Should.Throw<RpcException>(() => PastOnlyRangeValidator.EnsurePastOnly(tmpBoundary))
+                .StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(c_OverrideEnvVar, tmpPrev);
+        }
+    }
+
+    [Fact]
+    public void Validator_PostCloseOverride_BeforeOpenTime_PreservesMidnightBoundary()
+    {
+        // Override set to one hour AFTER current ET wall-clock → not yet
+        // active → today still rejected.
+        var tmpPrev = Environment.GetEnvironmentVariable(c_OverrideEnvVar);
+        var tmpFutureOpenAt = NowEtTimeOfDay().Add(TimeSpan.FromHours(1));
+        if (tmpFutureOpenAt >= TimeSpan.FromHours(24))
+        {
+            // Edge case: late-night run would wrap past 24h. Skip rather
+            // than write a brittle assertion. Validator's behaviour at
+            // the day-wrap boundary is covered by the other override tests.
+            return;
+        }
+        Environment.SetEnvironmentVariable(
+            c_OverrideEnvVar, $"{tmpFutureOpenAt.Hours:D2}:{tmpFutureOpenAt.Minutes:D2}");
+        try
+        {
+            var tmpBoundary = TodayBoundaryUtc();
+            Should.Throw<RpcException>(() => PastOnlyRangeValidator.EnsurePastOnly(tmpBoundary))
+                .StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(c_OverrideEnvVar, tmpPrev);
+        }
+    }
+
+    [Fact]
+    public void Validator_PostCloseOverride_AfterOpenTime_AdvancesBoundary()
+    {
+        // Override set to "00:01" → guaranteed to be past for any test
+        // run after 00:01 ET. Today's midnight UTC must now PASS (no
+        // throw); anything at-or-after tomorrow's midnight ET still
+        // fails.
+        var tmpPrev = Environment.GetEnvironmentVariable(c_OverrideEnvVar);
+        Environment.SetEnvironmentVariable(c_OverrideEnvVar, "00:01");
+        try
+        {
+            // If the test happens to run at exactly 00:00:00–00:00:59
+            // ET, the override hasn't fired yet. Skip rather than flake.
+            if (NowEtTimeOfDay() < TimeSpan.FromMinutes(1)) return;
+
+            var tmpBoundary = TodayBoundaryUtc();
+            // Range ending at today's midnight (pre-override boundary)
+            // used to fail; with the override active, that range is now
+            // entirely past-day. Should pass.
+            Should.NotThrow(() => PastOnlyRangeValidator.EnsurePastOnly(
+                tmpBoundary.AddDays(-1), tmpBoundary));
+
+            // But a point at tomorrow's midnight ET (the NEW boundary)
+            // is still future → must throw.
+            var tmpEt = ResolveEasternTz();
+            var tmpNowEt = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tmpEt);
+            var tmpTomorrowMidnightEt = new DateTime(
+                tmpNowEt.Year, tmpNowEt.Month, tmpNowEt.Day, 0, 0, 0, DateTimeKind.Unspecified)
+                .AddDays(1);
+            var tmpTomorrowMidnightUtc = TimeZoneInfo.ConvertTimeToUtc(tmpTomorrowMidnightEt, tmpEt);
+            Should.Throw<RpcException>(() =>
+                PastOnlyRangeValidator.EnsurePastOnly(tmpTomorrowMidnightUtc))
+                .StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(c_OverrideEnvVar, tmpPrev);
+        }
+    }
+
+    [Fact]
+    public void Validator_PostCloseOverride_Malformed_FallsBackToDefaultBoundary()
+    {
+        // Garbage value → TimeSpan.TryParse fails → validator silently
+        // falls through to the default midnight-ET boundary. Belt-and-
+        // braces against operator typos in compose env vars.
+        var tmpPrev = Environment.GetEnvironmentVariable(c_OverrideEnvVar);
+        Environment.SetEnvironmentVariable(c_OverrideEnvVar, "not-a-time");
+        try
+        {
+            var tmpBoundary = TodayBoundaryUtc();
+            Should.Throw<RpcException>(() => PastOnlyRangeValidator.EnsurePastOnly(tmpBoundary))
+                .StatusCode.ShouldBe(StatusCode.FailedPrecondition);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(c_OverrideEnvVar, tmpPrev);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // EnsureRangeCached (server-streaming RPC).
     //
     // The validator must fire BEFORE any stream write. An invalid range
