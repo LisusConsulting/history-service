@@ -123,6 +123,16 @@ builder.Services.AddScoped<IDailyOptionsFlowProvider, DailyOptionsFlowProvider>(
 // daily_atm_iv) land cleanly without re-touching this registration.
 builder.Services.AddScoped<IDailyAtmIvProvider, DailyAtmIvProvider>();
 
+// --- Intraday ATM-IV (HWZ-36, 2026-05-27) -------------------------------
+// Write + read surface for the intraday_atm_iv table (migration 016).
+// Replaces the direct-Npgsql shortcut MBD used during Phase B.2/B.3.
+// The live engine calls RecordIntradayAtmIv on every ~5-min refresh;
+// backtests of recent days call ListIntradayAtmIv (window pre-load) or
+// GetIntradayAtmIvAtOrBefore (ad-hoc) to read the live engine's actual
+// readings instead of falling back to N-1 daily_atm_iv. Scoped to
+// match the rest of the provider graph.
+builder.Services.AddScoped<IIntradayAtmIvProvider, IntradayAtmIvProvider>();
+
 // Wave C / PR 6 — aggregator (pure read of historical_options_snapshots
 // → DailyAtmIvRow) shared by the daily 08:00 ET cron and the seeder
 // backfill surface (--surface daily_atm_iv). Scoped so the registration

@@ -9,6 +9,7 @@ using DomainBarTimeframe = MomentumBreakoutDetector.HistoryService.Domain.BarTim
 using V1Bar = MomentumBreakoutDetector.HistoryService.Contracts.V1.Bar;
 using V1DailyOptionsFlowRow = MomentumBreakoutDetector.HistoryService.Contracts.V1.DailyOptionsFlowRow;
 using V1DailyAtmIvRow = MomentumBreakoutDetector.HistoryService.Contracts.V1.DailyAtmIvRow;
+using V1IntradayAtmIvRow = MomentumBreakoutDetector.HistoryService.Contracts.V1.IntradayAtmIvRow;
 
 namespace MomentumBreakoutDetector.HistoryService;
 
@@ -51,6 +52,10 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
     // past-day backtest reads of aggregated ATM-IV. Nullable for tests
     // that omit DI; in production the scoped registration is always present.
     private readonly IDailyAtmIvProvider? _dailyAtmIvProvider;
+    // HWZ-36 (2026-05-27) — intraday_atm_iv surface. Write + read. Nullable
+    // for tests that omit DI; in production the scoped registration is
+    // always present.
+    private readonly IIntradayAtmIvProvider? _intradayAtmIvProvider;
     // Phase 1 micro-PR #8 — observability surface. Nullable for tests
     // that bypass DI; in production the singleton is always registered.
     private readonly MetricsCollector? _metrics;
@@ -63,6 +68,7 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         IOptionChainProvider? optionChainProvider = null,
         IDailyOptionsFlowProvider? dailyOptionsFlowProvider = null,
         IDailyAtmIvProvider? dailyAtmIvProvider = null,
+        IIntradayAtmIvProvider? intradayAtmIvProvider = null,
         MetricsCollector? metrics = null)
     {
         _logger = logger;
@@ -72,6 +78,7 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
         _optionChainProvider = optionChainProvider;
         _dailyOptionsFlowProvider = dailyOptionsFlowProvider;
         _dailyAtmIvProvider = dailyAtmIvProvider;
+        _intradayAtmIvProvider = intradayAtmIvProvider;
         _metrics = metrics;
     }
 
@@ -910,6 +917,155 @@ public sealed class HistoryServiceImpl : Contracts.V1.HistoryService.HistoryServ
                 AtmIvIsNull = !tmpRow.AtmIv.HasValue,
                 ContractCount = tmpRow.ContractCount ?? 0,
                 ContractCountIsNull = !tmpRow.ContractCount.HasValue,
+            });
+        }
+        return tmpResp;
+    }
+
+    // ─── Intraday ATM-IV (HWZ-36, 2026-05-27) ────────────────────────────
+    // Write + read surface for the intraday_atm_iv table (migration 016).
+    // Live engine writes every ~5 min during RTH; backtests of today /
+    // recent days read it back so replays consult the same intraday IV
+    // the live engine actually saw, instead of N-1 daily close.
+    //
+    // NOT past-only: the surface's whole purpose is to let backtests of
+    // today read today's live writes. No-lookahead is enforced implicitly
+    // by the at-or-before / range read semantics — a row stamped after
+    // the requested timestamp is never returned.
+
+    /// <summary>
+    /// Idempotent UPSERT keyed on (underlying_ticker, captured_at). The
+    /// live engine's SignalSourcesService calls this on every refresh.
+    /// </summary>
+    public override async Task<RecordIntradayAtmIvResponse> RecordIntradayAtmIv(
+        RecordIntradayAtmIvRequest request, ServerCallContext context)
+    {
+        if (_intradayAtmIvProvider is null)
+        {
+            throw new RpcException(new Status(StatusCode.Unimplemented,
+                "Intraday-atm-iv provider is not registered."));
+        }
+        if (string.IsNullOrWhiteSpace(request.UnderlyingTicker))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "underlying_ticker is required."));
+        }
+        if (request.CapturedAt is null)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "captured_at is required."));
+        }
+        if (request.ContractCount < 0)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "contract_count must be >= 0."));
+        }
+
+        var tmpCapturedAtUtc = request.CapturedAt.ToDateTime();
+        var tmpAtmIv = (decimal)request.AtmIv;
+
+        var tmpInserted = await _intradayAtmIvProvider
+            .RecordAsync(request.UnderlyingTicker, tmpCapturedAtUtc,
+                         tmpAtmIv, request.ContractCount, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        return new RecordIntradayAtmIvResponse { Inserted = tmpInserted };
+    }
+
+    /// <summary>
+    /// Most-recent row whose captured_at &lt;= at_or_before_utc. Ad-hoc /
+    /// diagnostic callers (the backtest's hot path uses ListIntradayAtmIv
+    /// instead — one server round-trip per run with client-side binary
+    /// search per bar).
+    /// </summary>
+    public override async Task<GetIntradayAtmIvAtOrBeforeResponse> GetIntradayAtmIvAtOrBefore(
+        GetIntradayAtmIvAtOrBeforeRequest request, ServerCallContext context)
+    {
+        if (_intradayAtmIvProvider is null)
+        {
+            throw new RpcException(new Status(StatusCode.Unimplemented,
+                "Intraday-atm-iv provider is not registered."));
+        }
+        if (string.IsNullOrWhiteSpace(request.UnderlyingTicker))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "underlying_ticker is required."));
+        }
+        if (request.AtOrBeforeUtc is null)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "at_or_before_utc is required."));
+        }
+
+        var tmpAt = request.AtOrBeforeUtc.ToDateTime();
+        var tmpRow = await _intradayAtmIvProvider
+            .GetAtOrBeforeAsync(request.UnderlyingTicker, tmpAt, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        if (tmpRow is null)
+        {
+            return new GetIntradayAtmIvAtOrBeforeResponse { Found = false };
+        }
+        return new GetIntradayAtmIvAtOrBeforeResponse
+        {
+            Found = true,
+            Row = new V1IntradayAtmIvRow
+            {
+                UnderlyingTicker = tmpRow.UnderlyingTicker,
+                CapturedAt = Timestamp.FromDateTime(
+                    DateTime.SpecifyKind(tmpRow.CapturedAt, DateTimeKind.Utc)),
+                AtmIv = (double)tmpRow.AtmIv,
+                ContractCount = tmpRow.ContractCount,
+            },
+        };
+    }
+
+    /// <summary>
+    /// Range read sorted ascending by captured_at. Backtest's primary
+    /// read path: one call per run, then client-side O(log n) binary
+    /// search per bar against the returned series.
+    /// </summary>
+    public override async Task<ListIntradayAtmIvResponse> ListIntradayAtmIv(
+        ListIntradayAtmIvRequest request, ServerCallContext context)
+    {
+        if (_intradayAtmIvProvider is null)
+        {
+            throw new RpcException(new Status(StatusCode.Unimplemented,
+                "Intraday-atm-iv provider is not registered."));
+        }
+        if (string.IsNullOrWhiteSpace(request.UnderlyingTicker))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "underlying_ticker is required."));
+        }
+        if (request.FromUtc is null || request.ToUtc is null)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "from_utc and to_utc are required."));
+        }
+
+        var tmpFrom = request.FromUtc.ToDateTime();
+        var tmpTo = request.ToUtc.ToDateTime();
+        if (tmpFrom > tmpTo)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument,
+                "from_utc must be <= to_utc."));
+        }
+
+        var tmpRows = await _intradayAtmIvProvider
+            .ListRangeAsync(request.UnderlyingTicker, tmpFrom, tmpTo, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        var tmpResp = new ListIntradayAtmIvResponse();
+        foreach (var tmpRow in tmpRows)
+        {
+            tmpResp.Rows.Add(new V1IntradayAtmIvRow
+            {
+                UnderlyingTicker = tmpRow.UnderlyingTicker,
+                CapturedAt = Timestamp.FromDateTime(
+                    DateTime.SpecifyKind(tmpRow.CapturedAt, DateTimeKind.Utc)),
+                AtmIv = (double)tmpRow.AtmIv,
+                ContractCount = tmpRow.ContractCount,
             });
         }
         return tmpResp;

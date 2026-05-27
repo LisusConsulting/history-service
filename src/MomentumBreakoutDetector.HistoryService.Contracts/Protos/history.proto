@@ -59,6 +59,25 @@ service HistoryService {
   // mode --surface daily_atm_iv. Read-only here; no upstream fetch on
   // miss (consumers run the seeder/cron first to populate a window).
   rpc GetDailyAtmIv (GetDailyAtmIvRequest) returns (GetDailyAtmIvResponse);
+
+  // ---- Intraday ATM-IV write + read (HWZ-36 / Phase B IV-parity).
+  //
+  // Captured by the LIVE engine's SignalSourcesService on every ~5-min
+  // OptionsAnalysisService refresh (RecordIntradayAtmIv). Backtests of
+  // recent days read it back via ListIntradayAtmIv (range pre-load) or
+  // GetIntradayAtmIvAtOrBefore (per-bar lookup) so replays consult the
+  // same intraday IV reading the live engine saw — closes the live↔
+  // backtest IV parity gap exposed on 2026-05-26 (TSLA crossed the 0.45
+  // High threshold intraday while N-1 daily close stayed Normal).
+  //
+  // NOT past-only. The whole point is that the live engine writes
+  // today's captures and backtests of today re-read them. Past-only
+  // would break the surface. The read path enforces no-lookahead
+  // implicitly via the at-or-before semantic — callers can never see a
+  // row stamped AFTER the timestamp they asked about.
+  rpc RecordIntradayAtmIv (RecordIntradayAtmIvRequest) returns (RecordIntradayAtmIvResponse);
+  rpc GetIntradayAtmIvAtOrBefore (GetIntradayAtmIvAtOrBeforeRequest) returns (GetIntradayAtmIvAtOrBeforeResponse);
+  rpc ListIntradayAtmIv (ListIntradayAtmIvRequest) returns (ListIntradayAtmIvResponse);
 }
 
 // ----------------------------------------------------------------------------
@@ -331,4 +350,63 @@ message DailyAtmIvRow {
 message GetDailyAtmIvResponse {
   repeated DailyAtmIvRow rows = 1;
   bool cache_hit = 2;                            // always true — no upstream on miss
+}
+
+// ----------------------------------------------------------------------------
+// Intraday ATM-IV (HWZ-36).
+//
+// Schema mirrors history-service's intraday_atm_iv table (migration 016):
+// (underlying_ticker, captured_at, atm_iv, contract_count). PRIMARY KEY
+// (underlying_ticker, captured_at), so re-records at the same minute
+// upsert in place.
+//
+// Read pattern: backtests call ListIntradayAtmIv once per run to pre-load
+// the window, then evaluate per bar with a client-side at-or-before
+// binary search (O(log n) per bar, vs N round-trips to the server).
+// GetIntradayAtmIvAtOrBefore exists for ad-hoc/diagnostic callers.
+// ----------------------------------------------------------------------------
+message RecordIntradayAtmIvRequest {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp captured_at = 2;     // UTC capture time from the live engine
+  double atm_iv = 3;                             // raw avg ATM IV (NOT regime label)
+  int32 contract_count = 4;                      // contracts that contributed to the avg
+}
+
+message RecordIntradayAtmIvResponse {
+  // True iff a brand-new row was inserted; false means an existing row
+  // at the same (underlying, captured_at) was upserted. Either way the
+  // post-condition is that the row reflects the request values.
+  bool inserted = 1;
+}
+
+message GetIntradayAtmIvAtOrBeforeRequest {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp at_or_before_utc = 2;
+}
+
+message IntradayAtmIvRow {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp captured_at = 2;
+  double atm_iv = 3;
+  int32 contract_count = 4;
+}
+
+message GetIntradayAtmIvAtOrBeforeResponse {
+  // Set iff a row exists with captured_at <= at_or_before_utc for the
+  // requested underlying. Absent means "no row yet" — caller should
+  // fall through to the daily ATM-IV lookup.
+  bool found = 1;
+  IntradayAtmIvRow row = 2;
+}
+
+message ListIntradayAtmIvRequest {
+  string underlying_ticker = 1;
+  google.protobuf.Timestamp from_utc = 2;        // inclusive
+  google.protobuf.Timestamp to_utc = 3;          // inclusive
+}
+
+message ListIntradayAtmIvResponse {
+  // Rows sorted ascending by captured_at. Empty when no rows exist —
+  // caller falls through to daily ATM-IV / Bollinger proxy.
+  repeated IntradayAtmIvRow rows = 1;
 }
