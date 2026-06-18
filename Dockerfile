@@ -23,6 +23,13 @@ ARG BUILD_TIME=unknown
 FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION} AS build
 WORKDIR /src
 
+# 2026-06-18: disable the online cert-revocation check during restore. The
+# Refit package's author-signature chain intermittently fails NU3012
+# ("certificate revoked") on a transient/false online OCSP check, breaking
+# the build. Mirrors the fix already in MomentumBreakoutDetector's API
+# Dockerfile. Offline mode trusts the local cert store + CRL cache.
+ENV NUGET_CERT_REVOCATION_MODE=offline
+
 # Copy central props first so restore caches by package list, not source.
 COPY Directory.Packages.props ./
 COPY src/MomentumBreakoutDetector.HistoryService.Contracts/MomentumBreakoutDetector.HistoryService.Contracts.csproj src/MomentumBreakoutDetector.HistoryService.Contracts/

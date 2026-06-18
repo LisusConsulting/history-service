@@ -206,6 +206,13 @@ builder.Services.AddHostedService<MomentumBreakoutDetector.HistoryService.Domain
 // PR 3 — daily refresh cron. Bind options from History:DailyFlowRefresh.
 builder.Services.Configure<DailyOptionsFlowRefreshOptions>(
     builder.Configuration.GetSection(DailyOptionsFlowRefreshOptions.SectionName));
+// 2026-06-18: de-dupe the symbol list. .NET's config binder APPENDS array
+// items onto a property whose initializer is already non-empty
+// (= new List{"TSLA"}), so appsettings ["TSLA","SPCX"] yields
+// ["TSLA","TSLA","SPCX"]. De-dupe once here so every cron iterates each
+// symbol exactly once (and guards operator typos too).
+builder.Services.PostConfigure<DailyOptionsFlowRefreshOptions>(o =>
+    o.Symbols = o.Symbols.Distinct(StringComparer.OrdinalIgnoreCase).ToList());
 builder.Services.AddHostedService<DailyOptionsFlowRefreshService>();
 
 // Wave C / PR 6 — daily_atm_iv refresh cron (08:00 ET, weekdays). Same
@@ -214,6 +221,9 @@ builder.Services.AddHostedService<DailyOptionsFlowRefreshService>();
 // History:DailyAtmIvRefresh.
 builder.Services.Configure<DailyAtmIvRefreshOptions>(
     builder.Configuration.GetSection(DailyAtmIvRefreshOptions.SectionName));
+// 2026-06-18: de-dupe (see DailyOptionsFlowRefreshOptions note above).
+builder.Services.PostConfigure<DailyAtmIvRefreshOptions>(o =>
+    o.Symbols = o.Symbols.Distinct(StringComparer.OrdinalIgnoreCase).ToList());
 builder.Services.AddHostedService<DailyAtmIvRefreshService>();
 
 // --- Live-capture cron (Wave B / PR 4 of the ATM-IV plan) ---------------
@@ -224,6 +234,9 @@ builder.Services.AddHostedService<DailyAtmIvRefreshService>();
 // post-bootstrap (Wave C / PR 9). Bind from History:LiveSnapshotCapture.
 builder.Services.Configure<LiveOptionsSnapshotCaptureOptions>(
     builder.Configuration.GetSection(LiveOptionsSnapshotCaptureOptions.SectionName));
+// 2026-06-18: de-dupe (see DailyOptionsFlowRefreshOptions note above).
+builder.Services.PostConfigure<LiveOptionsSnapshotCaptureOptions>(o =>
+    o.LiveSnapshotCaptureSymbols = o.LiveSnapshotCaptureSymbols.Distinct(StringComparer.OrdinalIgnoreCase).ToList());
 builder.Services.AddHostedService<LiveOptionsSnapshotCaptureService>();
 
 // --- Option chains (micro-PR #4) -----------------------------------------
