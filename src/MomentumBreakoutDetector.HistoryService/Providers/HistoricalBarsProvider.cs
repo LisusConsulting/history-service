@@ -343,20 +343,24 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
 
         // 4. expected − cached − marked. Iterate expected once, drop any
         // ts that's cached OR shadowed by a marker, collect the survivors.
+        //
+        // 2026-07-14: the marker set is LARGE — a multi-year 1-min range
+        // accumulates one no-data marker per no-trade minute (MU/PLTR/NVDA
+        // full-history backfills each hold 0.6–0.9M rows). The old
+        // per-ts × per-marker linear scan was O(expected × markers) ≈
+        // 0.9M × 0.9M ≈ 8×10^11 comparisons for ONE symbol's full-history
+        // warmup — the gRPC handler spun past its deadline holding the
+        // connection, which starved every other bars read (the 2026-07-14
+        // chart outage). Coalesce the markers into a sorted, non-overlapping
+        // interval list ONCE, then binary-search each expected ts →
+        // O(expected · log markers). The shadowed-set is byte-identical.
+        var tmpMarkerIntervals = CoalesceMarkerIntervals(tmpMarkerRows);
         var tmpMissing = new List<DateTime>(tmpExpected.Count);
         foreach (var tmpTs in tmpExpected)
         {
             if (tmpCached.Contains(tmpTs)) continue;
-            var tmpShadowed = false;
-            foreach (var tmpMarker in tmpMarkerRows)
-            {
-                if (tmpTs >= tmpMarker.RangeFrom && tmpTs <= tmpMarker.RangeTo)
-                {
-                    tmpShadowed = true;
-                    break;
-                }
-            }
-            if (!tmpShadowed) tmpMissing.Add(tmpTs);
+            if (IsCoveredByIntervals(tmpMarkerIntervals, tmpTs)) continue;
+            tmpMissing.Add(tmpTs);
         }
 
         if (tmpMissing.Count == 0)
@@ -585,6 +589,71 @@ public sealed class HistoricalBarsProvider : IHistoricalBarsProvider
         }
         tmpResult.Add((tmpRangeStart, tmpRangeEnd));
         return tmpResult;
+    }
+
+    /// <summary>
+    /// Coalesce the raw miss-marker rows for a (symbol, timeframe) into a
+    /// sorted, NON-overlapping list of [From, To] intervals so
+    /// <see cref="IsCoveredByIntervals"/> can test coverage in O(log n)
+    /// instead of the O(n) linear scan the naive per-timestamp shadow check
+    /// used. The markers can arrive fragmented (one row per no-trade minute,
+    /// ~0.9M for a full-history symbol) and possibly overlapping/adjacent;
+    /// coalescing is O(n log n) once, then reused for every expected ts.
+    /// Internal so unit tests can pin the math without a Postgres container.
+    /// </summary>
+    internal static List<(DateTime From, DateTime To)> CoalesceMarkerIntervals(
+        IReadOnlyList<MissRow> inMarkers)
+    {
+        if (inMarkers.Count == 0) return new List<(DateTime, DateTime)>();
+
+        var tmpSorted = inMarkers
+            .Select(m => (
+                From: DateTime.SpecifyKind(m.RangeFrom, DateTimeKind.Utc),
+                To: DateTime.SpecifyKind(m.RangeTo, DateTimeKind.Utc)))
+            .OrderBy(r => r.From)
+            .ToList();
+
+        var tmpOut = new List<(DateTime From, DateTime To)>();
+        var tmpCurFrom = tmpSorted[0].From;
+        var tmpCurTo = tmpSorted[0].To;
+        for (var i = 1; i < tmpSorted.Count; i++)
+        {
+            var (tmpFrom, tmpTo) = tmpSorted[i];
+            if (tmpFrom <= tmpCurTo)
+            {
+                // Overlapping or touching — extend the current interval.
+                if (tmpTo > tmpCurTo) tmpCurTo = tmpTo;
+            }
+            else
+            {
+                tmpOut.Add((tmpCurFrom, tmpCurTo));
+                tmpCurFrom = tmpFrom;
+                tmpCurTo = tmpTo;
+            }
+        }
+        tmpOut.Add((tmpCurFrom, tmpCurTo));
+        return tmpOut;
+    }
+
+    /// <summary>
+    /// True iff <paramref name="inTs"/> falls inside any interval in the
+    /// sorted, non-overlapping <paramref name="inIntervals"/> produced by
+    /// <see cref="CoalesceMarkerIntervals"/>. Binary search on the interval
+    /// bounds — equivalent to "some marker range covers ts".
+    /// </summary>
+    internal static bool IsCoveredByIntervals(
+        IReadOnlyList<(DateTime From, DateTime To)> inIntervals, DateTime inTs)
+    {
+        int tmpLo = 0, tmpHi = inIntervals.Count - 1;
+        while (tmpLo <= tmpHi)
+        {
+            var tmpMid = tmpLo + ((tmpHi - tmpLo) >> 1);
+            var tmpIv = inIntervals[tmpMid];
+            if (inTs < tmpIv.From) tmpHi = tmpMid - 1;
+            else if (inTs > tmpIv.To) tmpLo = tmpMid + 1;
+            else return true;
+        }
+        return false;
     }
 
     /// <summary>
