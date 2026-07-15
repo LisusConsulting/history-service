@@ -398,6 +398,49 @@ public sealed class BarsIntraRangeGapDetectionTests : IAsyncLifetime
         tmpRanges[1].To.ShouldBe(tmpInput[4]);
     }
 
+    // ── 9. Windowed rewrite: a local write must NOT touch far-away markers ──
+
+    [Fact]
+    public async Task LocalWrite_DoesNotRewriteFarAwayMarkers()
+    {
+        // Regression for the 2026-07-14 chart outage AND its 07-15 recurrence.
+        // RangeMarkerWriter used to read + DELETE-all + re-INSERT EVERY marker
+        // row for the key on every write. For TSLA 1-min (~25k no-trade-minute
+        // markers over years) that turned each incremental write (e.g. a chart
+        // request hitting today's empty pre-market gap) into a full-table
+        // rewrite that held the advisory lock and starved 1-min chart reads.
+        // The fix bounds the read/delete to the adjacency window of the new
+        // ranges. Assert a marker FAR outside the write window is left
+        // untouched: its distinct reason survives (the old full-key rewrite
+        // would have DELETEd it and re-stamped it 'no-data-from-polygon').
+        var tmpFarFrom = new DateTime(2022, 8, 25, 14, 0, 0, DateTimeKind.Utc);
+        await InsertMarkerAsync("1min", tmpFarFrom,
+            new DateTime(2022, 8, 25, 14, 29, 0, DateTimeKind.Utc)); // reason 'test-seed'
+
+        // Empty upstream over the 2026-04-15 window → writes a local marker.
+        var tmpStub = new RecordingFetcher(returnEmpty: true, fillBars: 0);
+        var tmpProvider = new HistoricalBarsProvider(
+            m_ConnStr, tmpStub, NullLogger<HistoricalBarsProvider>.Instance);
+        await tmpProvider.EnsureRangeCachedAsync(
+            "TSLA", s_From, s_To, BarTimeframe.OneMinute);
+
+        await using var tmpConn = new NpgsqlConnection(m_ConnStr);
+        await tmpConn.OpenAsync();
+        var tmpFarReason = await tmpConn.ExecuteScalarAsync<string>(
+            """
+            SELECT reason FROM historical_bars_misses
+            WHERE symbol = 'TSLA' AND timeframe = '1min' AND range_from = @F
+            """,
+            new { F = tmpFarFrom });
+        tmpFarReason.ShouldBe("test-seed",
+            "a local marker write must NOT rewrite a far-away marker — the old "
+            + "full-key rewrite would have re-stamped it 'no-data-from-polygon'");
+
+        // Two rows now: the untouched 2022 marker + the new 2026 local marker.
+        (await CountMarkersAsync("1min")).ShouldBe(2L,
+            "far marker left in place + one new local marker");
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────
 
     private async Task<long> CountBarsAsync(string inTimeframe)

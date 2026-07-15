@@ -90,25 +90,48 @@ public static class RangeMarkerWriter
         }
         var tmpKeyWhere = string.Join(" AND ", tmpWhereClauses);
 
-        // Read existing markers for this key. We pull every row regardless
-        // of overlap with inNewRanges — the merge logic below decides what
-        // is mergeable. For tables with very large marker counts per key
-        // this could be optimised to a windowed read, but per-key marker
-        // counts are bounded by the seed-window size (worst case: O(days)
-        // per surface) which is well within an in-memory scan.
-        //
-        // Cast columns to TIMESTAMPTZ before binding so the helper works
-        // uniformly across TIMESTAMPTZ-typed marker tables (bars / NBBO)
-        // and DATE-typed ones (chains / macro post PR #21 / #22). Without
-        // the cast, Dapper's binder fights Npgsql's DATE → DateOnly
-        // mapping when the destination type is DateTimeOffset.
+        // 2026-07-15: WINDOWED read/delete. Only markers within the adjacency
+        // window of the new ranges can possibly merge with them; every marker
+        // outside [min(newFrom) - adj, max(newTo) + adj] is > adjacency from
+        // every new range, so it is guaranteed non-mergeable and MUST be left
+        // untouched. The original code read + DELETE-all + re-INSERT-all rows
+        // for the key on EVERY write — O(all markers per key). For bars that
+        // assumption ("bounded by the seed-window") is false: TSLA 1-min
+        // accumulates ~25k no-trade-minute markers over years, so each
+        // incremental write (e.g. a chart request hitting today's empty
+        // pre-market gap) rewrote all 25k rows under the advisory lock,
+        // holding it for seconds and starving concurrent 1-min chart reads
+        // (the 2026-07-14 outage AND its 07-15 recurrence). Bounding the
+        // read/delete to the window makes every write O(local markers).
+        // Correctness: a marker outside the window cannot abut a coalesced
+        // result either — merging with new can only extend a windowed marker
+        // to the RIGHT (new.From >= minNewFrom = winFrom + adj), never past
+        // winFrom toward an outside marker — so no merge is missed.
+        var tmpAdj = TimeSpan.FromTicks(Math.Max(0L, inAdjacencyTicks));
+        var tmpWinFrom = inNewRanges.Min(r => r.From) - tmpAdj;
+        var tmpWinTo = inNewRanges.Max(r => r.To) + tmpAdj;
+        var tmpWinParams = new DynamicParameters(tmpKeyParams);
+        tmpWinParams.Add("__WinFrom", tmpWinFrom);
+        tmpWinParams.Add("__WinTo", tmpWinTo);
+        // Cast columns to TIMESTAMPTZ so the window predicate + the SELECT
+        // work uniformly across TIMESTAMPTZ-typed tables (bars / NBBO) and
+        // DATE-typed ones (chains / macro); a DATE marker compares at UTC
+        // midnight. Without the cast, Dapper's binder fights Npgsql's
+        // DATE → DateOnly mapping when the destination is DateTimeOffset.
+        var tmpWindowWhere =
+            $"{tmpKeyWhere} "
+            + $"AND {inSpec.RangeToColumn}::timestamptz >= @__WinFrom "
+            + $"AND {inSpec.RangeFromColumn}::timestamptz <= @__WinTo";
+
+        // Read existing markers WITHIN THE WINDOW (see above). The merge
+        // logic below decides what is mergeable among these.
         var tmpExistingRows = (await inConn.QueryAsync<(DateTimeOffset From, DateTimeOffset To)>(
             $"""
             SELECT {inSpec.RangeFromColumn}::timestamptz AS "From",
                    {inSpec.RangeToColumn}::timestamptz   AS "To"
             FROM {inSpec.TableName}
-            WHERE {tmpKeyWhere}
-            """, tmpKeyParams).ConfigureAwait(false)).ToList();
+            WHERE {tmpWindowWhere}
+            """, tmpWinParams).ConfigureAwait(false)).ToList();
 
         // Merge: union of existing + new, sorted by From, sweep & coalesce
         // any two ranges where the gap between them is <= adjacencyTicks.
@@ -158,16 +181,19 @@ public static class RangeMarkerWriter
                 SELECT {inSpec.RangeFromColumn}::timestamptz AS "From",
                        {inSpec.RangeToColumn}::timestamptz   AS "To"
                 FROM {inSpec.TableName}
-                WHERE {tmpKeyWhere}
-                """, tmpKeyParams, tmpTx).ConfigureAwait(false)).ToList();
+                WHERE {tmpWindowWhere}
+                """, tmpWinParams, tmpTx).ConfigureAwait(false)).ToList();
             tmpAll.Clear();
             tmpAll.AddRange(tmpExistingUnderLock);
             tmpAll.AddRange(inNewRanges);
             tmpMerged = Coalesce(tmpAll, inAdjacencyTicks);
 
+            // DELETE only the windowed rows we just read + are about to
+            // re-insert (coalesced). Markers outside the window are left
+            // in place — that's what bounds the write to O(local markers).
             await inConn.ExecuteAsync(
-                $"DELETE FROM {inSpec.TableName} WHERE {tmpKeyWhere}",
-                tmpKeyParams, tmpTx).ConfigureAwait(false);
+                $"DELETE FROM {inSpec.TableName} WHERE {tmpWindowWhere}",
+                tmpWinParams, tmpTx).ConfigureAwait(false);
 
             foreach (var tmpRange in tmpMerged)
             {
