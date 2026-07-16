@@ -22,6 +22,7 @@ logs/
 
 # Local scratch (seeder checkpoints, ad-hoc smoke runs, etc.)
 .tmp/
+.tmp-*
 
 # Seeder operator artifacts — checkpoints + per-symbol run logs +
 # detached-process PID files. All local runtime state.

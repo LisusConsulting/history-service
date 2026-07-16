@@ -123,11 +123,24 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
                 }
                 case PolygonNbboOutcome.Miss:
                 {
+                    // Record the DB miss-marker so future calls skip Polygon,
+                    // then try the last-known stale quote (no freshness floor)
+                    // before returning null → $0. Only poison the in-memory
+                    // miss when even that finds nothing, so future lookups keep
+                    // reaching the stale fallback (via the step-5 miss-marker path).
                     await RecordMissAsync(
                         inTicker, inTsUtc, tmpFetch.MissReason ?? "miss", inCt)
                         .ConfigureAwait(false);
-                    m_MemCache.PutMiss(inTicker, inTsUtc);
                     m_Metrics?.RecordMissMarker(MetricKind.Nbbo);
+                    var tmpStale = await TryGetLastKnownAsync(inTicker, inTsUtc, inCt)
+                        .ConfigureAwait(false);
+                    if (tmpStale is not null)
+                    {
+                        tmpResult = new OptionQuotesLookup(
+                            tmpStale, CacheHit: false, IsMissMarker: false);
+                        return;
+                    }
+                    m_MemCache.PutMiss(inTicker, inTsUtc);
                     tmpResult = new OptionQuotesLookup(
                         null, CacheHit: false, IsMissMarker: true);
                     return;
@@ -190,9 +203,19 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
             return new OptionQuotesLookup(tmpDb, CacheHit: true, IsMissMarker: false);
         }
 
-        // 5) Postgres miss-marker?
+        // 5) Postgres miss-marker? Upstream already had nothing at this minute.
+        //    Before declaring a hard miss (→ null → $0 in the fill path), try
+        //    the last-known stale quote (no freshness floor). Only set the
+        //    in-memory miss when even that finds nothing, so future lookups
+        //    keep reaching the stale fallback rather than short-circuiting to null.
         if (await IsKnownMissAsync(inTicker, inTsUtc, inCt).ConfigureAwait(false))
         {
+            var tmpStale = await TryGetLastKnownAsync(inTicker, inTsUtc, inCt).ConfigureAwait(false);
+            if (tmpStale is not null)
+            {
+                m_Metrics?.RecordCacheHit(MetricKind.Nbbo);
+                return new OptionQuotesLookup(tmpStale, CacheHit: true, IsMissMarker: false);
+            }
             m_MemCache.PutMiss(inTicker, inTsUtc);
             m_Metrics?.RecordCacheHit(MetricKind.Nbbo);
             return new OptionQuotesLookup(null, CacheHit: true, IsMissMarker: true);
@@ -243,6 +266,50 @@ public sealed class OptionQuotesProvider : IOptionQuotesProvider
                 .ConfigureAwait(false);
         }
 
+        if (tmpRow is null) return null;
+        return new OptionQuoteRecord(
+            Ticker: tmpRow.Ticker,
+            RequestedTsUtc: DateTime.SpecifyKind(tmpRow.RequestedTs, DateTimeKind.Utc),
+            AsOfTsUtc: DateTime.SpecifyKind(tmpRow.AsOfTs ?? tmpRow.RequestedTs, DateTimeKind.Utc),
+            BidPrice: tmpRow.BidPrice ?? 0m,
+            AskPrice: tmpRow.AskPrice ?? 0m,
+            BidSize: tmpRow.BidSize,
+            AskSize: tmpRow.AskSize,
+            BidExchange: tmpRow.BidExchange,
+            AskExchange: tmpRow.AskExchange);
+    }
+
+    /// <summary>
+    /// 2026-06-28 — LAST-RESORT at-or-before lookup with NO freshness floor:
+    /// the most-recent cached quote at-or-before <paramref name="inTsUtc"/>
+    /// regardless of age. Used ONLY when the normal path (in-window fuzzy +
+    /// Polygon) has fully MISSED. Rescues forced-exit fill pricing on sparse
+    /// fresh-symbol contracts whose exact-minute NBBO upstream lacks but which
+    /// DO have an earlier cached quote — without this they price null → $0,
+    /// silently dropping a spread leg and producing garbage backtest P&L
+    /// (observed: MU/SMCI/ARM, 44/72 contracts entry-quote-only). The record
+    /// carries its real AsOfTs, so freshness-sensitive callers (the exit-
+    /// DECISION pass) still defer on stale data; only the fill path — which
+    /// has no fresh quote either way — benefits. PARITY-SAFE: dense symbols
+    /// (TSLA) almost never reach a full miss, so this rarely runs for them.
+    /// </summary>
+    private async Task<OptionQuoteRecord?> TryGetLastKnownAsync(
+        string inTicker, DateTime inTsUtc, CancellationToken inCt)
+    {
+        await using var tmpConn = new NpgsqlConnection(m_ConnectionString);
+        await tmpConn.OpenAsync(inCt).ConfigureAwait(false);
+        var tmpRow = await tmpConn.QueryFirstOrDefaultAsync<QuoteRow>(
+            """
+            SELECT ticker AS Ticker, ts AS RequestedTs, as_of_ts AS AsOfTs,
+                   bid_price AS BidPrice, ask_price AS AskPrice,
+                   bid_size AS BidSize, ask_size AS AskSize,
+                   bid_exchange AS BidExchange, ask_exchange AS AskExchange
+            FROM historical_options_quotes
+            WHERE ticker = @Ticker AND ts <= @Ts
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            new { Ticker = inTicker, Ts = inTsUtc }).ConfigureAwait(false);
         if (tmpRow is null) return null;
         return new OptionQuoteRecord(
             Ticker: tmpRow.Ticker,
