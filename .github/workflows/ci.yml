@@ -9,6 +9,13 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      # Skip online cert-revocation checks during NuGet restore. Author-signed
+      # packages fail NU3012 the moment an author's signing cert is revoked
+      # even though the package itself is unchanged and trusted (Refit 10.1.6,
+      # 2026-07: cert 'CN=Glenn Watson' revoked mid-life). Offline mode still
+      # validates the signature and chain, just doesn't call OCSP/CRL.
+      NUGET_CERT_REVOCATION_MODE: offline
     steps:
       - uses: actions/checkout@v4
         with:
