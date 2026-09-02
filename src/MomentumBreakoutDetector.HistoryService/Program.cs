@@ -22,6 +22,13 @@ var builder = WebApplication.CreateBuilder(args);
 // --- Logging --------------------------------------------------------------
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
+    // 2026-09-02: ASP.NET request/endpoint chatter (6-8 lines per health
+    // check and per gRPC call) produced a 46 GB / 279M-line unrotated
+    // container log in 6 weeks. The appsettings "Logging" section is
+    // ignored by this code-configured Serilog pipeline, so the override
+    // has to live here. Service-level logs stay at Information.
+    .MinimumLevel.Override("Microsoft.AspNetCore", Serilog.Events.LogEventLevel.Warning)
+    .MinimumLevel.Override("Grpc.AspNetCore", Serilog.Events.LogEventLevel.Warning)
     .Enrich.FromLogContext()
     .WriteTo.Console()
     .CreateLogger();

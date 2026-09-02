@@ -38,6 +38,15 @@ services:
     image: mbd-history:local
     container_name: mbd-history
     restart: unless-stopped
+    # 2026-09-02: the previous container (created 07-17, no rotation) reached
+    # a 46 GB / 279M-line json log; a blank entry written at the 07-19 15:10Z
+    # stop also broke every forward read (`docker logs --since` returned 0
+    # lines for six weeks). Same policy as the MBD api containers (100m x 10).
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
     depends_on:
       mbd-history-postgres:
         condition: service_healthy
